@@ -22,7 +22,7 @@ class MessageBus:
         await self.inbound.put(msg)
 
     async def consume_inbound(self) -> InboundMessage:
-        """Consume the next inbound message (blocks until available)."""
+        """Consume/retrieve the next inbound message (blocks until available)."""
         return await self.inbound.get()
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
