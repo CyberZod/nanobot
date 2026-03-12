@@ -510,4 +510,28 @@ builder.add_assistant_message(messages, None, tool_calls=[...])
 - **Schemas Sent Every Turn**: On every LLM call, ALL tool schemas are sent via `tools=self.tools.get_definitions()`. There is no progressive loading for tools yet (unlike Skills, which use summaries). This means adding many MCP tools increases token usage on every turn.
 - **Timeout Protection**: Each MCP tool call is wrapped in `asyncio.wait_for(timeout=30s)`. If the external server hangs, it gracefully returns an error string instead of crashing.
 
+---
+
+## Checkpoint 17: Provider Routing & Environment Variables
+**Date:** 2026-03-11
+**Files Covered:** [schema.py](file:///c:/Users/user/Documents/Dev/nanobot/nanobot/config/schema.py), [registry.py](file:///c:/Users/user/Documents/Dev/nanobot/nanobot/providers/registry.py)
+
+### Key Insights
+- **The Routing Logic (`_match_provider`)**: When the bot receives a model string (like `"claude-3.5-sonnet"`), it routes the request in three stages:
+  1. **Explicit Prefix:** Does it start with an explicit provider? (e.g., `"openrouter/"`) → Matches OpenRouter directly.
+  2. **Keyword Matching:** Does the name contain a known keyword? (e.g., `"claude"` keyword matches `anthropic`). If the matched provider actually has an API key configured, it routes there natively.
+  3. **Gateway Fallback:** If the keyword match fails or the direct provider is missing an API key (but you have an OpenRouter key starting with `sk-or-` configured in `providers.openrouter.api_key`), the request gracefully falls back to the OpenRouter gateway.
+- **Environment Variable Overrides**: pydantic-settings binds anything prefixed with `NANOBOT_` directly to the `Config` hierarchy, using `__` for nesting. Want to change the model without opening `config.json`? Run `$env:NANOBOT_AGENTS__DEFAULTS__MODEL = "openrouter/qwen/qwen3.5-9b"`. `agents.defaults.model` dictates the brain of the single `AgentLoop` instance started by the bot.
+
+---
+
+## Checkpoint 18: Channel Sessions & User Isolation
+**Date:** 2026-03-11
+**Files Covered:** [manager.py](file:///c:/Users/user/Documents/Dev/nanobot/nanobot/session/manager.py), [commands.py](file:///c:/Users/user/Documents/Dev/nanobot/nanobot/cli/commands.py)
+
+### Key Insights
+- **The CLI is just another Channel**: When you run the single-shot test (`nanobot agent -m "..."`), it doesn't bypass the session system. It simply uses the default session ID of `"cli:direct"`. Every interaction gets a session.
+- **Per-User / Per-Chat Isolation**: Channels like Telegram and WhatsApp don't have a single "Telegram Session". They dynamically generate IDs based on the user or group ID (e.g., `"telegram:123456"`, `"whatsapp:14155552671"`).
+- **The Beauty of Abstraction**: The core `AgentLoop` receives a raw `InboundMessage` with a `session_id`. It just pulls that file, reads the history, and responds. It has absolutely no idea if it's talking to someone on WhatsApp, Telegram, or the Terminal. This means millions of users can message the same bot instance on WhatsApp simultaneously, and each gets their own perfectly isolated `.jsonl` session file!
+
 *(More checkpoints will be added as we progress...)*
