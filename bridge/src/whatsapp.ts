@@ -81,9 +81,10 @@ export class WhatsAppClient {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // Display QR code in terminal
         console.log('\n📱 Scan this QR code with WhatsApp (Linked Devices):\n');
         qrcode.generate(qr, { small: true });
+        console.log('\nIf the QR code above is too large or distorted, Ctrl+Click this link to view it in your browser:');
+        console.log(`https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qr)}&size=400x400\n`);
         this.options.onQR(qr);
       }
 
