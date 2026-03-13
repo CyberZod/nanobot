@@ -117,13 +117,20 @@ export class WhatsAppClient {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (msg.key.fromMe) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
 
         const unwrapped = baileysExtractMessageContent(msg.message);
         if (!unwrapped) continue;
 
         const content = this.getTextContent(unwrapped);
+        
+        // Prevent infinite loops by ignoring our own messages, UNLESS they start with a trigger.
+        if (msg.key.fromMe) {
+          const lowerContent = (content || '').toLowerCase();
+          if (!lowerContent.startsWith('tales,') && !lowerContent.startsWith('hey tales,')) {
+            continue;
+          }
+        }
         let fallbackContent: string | null = null;
         const mediaPaths: string[] = [];
 
