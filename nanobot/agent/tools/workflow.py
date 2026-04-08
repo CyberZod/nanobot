@@ -70,10 +70,12 @@ class WorkflowTool(Tool):
         session_id: str | None = None,
         **kwargs: Any,
     ) -> str:
-        # Detect finalize action
-        is_finalize = message.strip().lower() == "finalize" and session_id
+        # Route to the right bridge action
+        msg_lower = message.strip().lower()
 
-        if is_finalize:
+        if msg_lower == "list_workflows":
+            request = {"action": "list_workflows"}
+        elif msg_lower == "finalize" and session_id:
             request = {
                 "action": "finalize",
                 "session_id": session_id,

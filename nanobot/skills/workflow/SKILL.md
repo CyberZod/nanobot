@@ -1,28 +1,54 @@
 ---
 name: workflow
-description: How to use the workflow tool to execute Maroc agency workflows (image generation, document mutation, etc.)
+description: How to use the workflow tool to discover and execute Maroc agency workflows (image generation, document mutation, etc.)
 always: true
 ---
 
-# Workflow Execution
+# Workflow Tool
 
-You have access to a `workflow` tool that delegates structured tasks to a specialized workflow agency. Use it when the user asks you to run a workflow, generate content, or process files through a multi-step pipeline.
+You have access to a `workflow` tool that connects to a specialized workflow agency. The agency has its own AI agent that executes structured, multi-step workflows (image generation, document processing, etc.). You are the intermediary — you discover workflows, relay instructions, deliver outputs, and manage the lifecycle.
 
-## How It Works
+## Discovering Workflows
 
-The `workflow` tool sends a message to the Maroc workflow agency, which has its own AI agent that executes structured workflows (image generation, document processing, etc.). You are the intermediary — you relay instructions and responses between the user and the agency.
+To see what workflows are available:
 
-## Usage Pattern
+```
+workflow(message="list_workflows")
+```
+
+Response:
+```json
+{
+  "workflows": [
+    {"name": "doc_mutation", "description": "Adjust text in PDF/DOCX", "inputs": [...]},
+    {"name": "image_caption", "description": "Generate image with text overlay", "inputs": [...]}
+  ]
+}
+```
+
+Each workflow has a `name`, `description`, and `inputs` (with `required` flag and `description`).
+
+**When to list workflows:**
+- When the user asks "what workflows are available?" or similar
+- When you're unsure which workflow fits a user's request
+- Present the results in a user-friendly way — don't dump raw JSON
+
+**When to match a workflow to a user request:**
+- If the user says "edit my PDF" → that's likely `doc_mutation`
+- If the user says "generate an image" → that's likely `image_caption`
+- If unsure, list workflows and ask the user which one they want
+
+## Executing a Workflow
 
 ### Starting a new workflow
 
-Call `workflow` with just a `message`. A new session is created automatically. The response includes a `session_id` you must use for follow-ups.
+Call `workflow` with a clear instruction. The agency agent will discover and execute the right workflow on its own. Include the workflow name if you know it.
 
 ```
 workflow(message="Use the image_caption workflow to generate an image with the text 'Hello World' displayed on it.")
 ```
 
-Response:
+Response includes a `session_id` (for follow-ups) and optionally `output_files`:
 ```json
 {"session_id": "sess_abc123", "response": "All steps complete! ...", "output_files": ["C:\\...\\image.png"]}
 ```
@@ -37,28 +63,28 @@ message(content="Here is the generated image. Please review.", media=["C:\\...\\
 
 ### Getting user approval and finalizing
 
-After the user reviews and approves, finalize the workflow using the **same session_id** with `action: "finalize"`:
+After the user reviews and approves, finalize the workflow:
 
 ```
 workflow(message="finalize", session_id="sess_abc123")
 ```
 
-This copies important files and cleans up temporary data.
+This copies important files to permanent storage and cleans up temporary data.
 
 ### Continuing a workflow (follow-ups)
 
-If the agency needs more information, relay the question to the user. When the user responds, pass their reply back with the same `session_id`:
+If the agency needs more information, relay to the user. Pass their reply back with the same `session_id`:
 
 ```
-workflow(message="The file is located at C:\\Users\\...\\doc.pdf", session_id="sess_abc123")
+workflow(message="The file is at C:\\Users\\...\\doc.pdf", session_id="sess_abc123")
 ```
 
-## Complete flow example
+## Complete Flow Example
 
 1. User: "Generate an image with the text 'Platform Verified'"
 2. You call `workflow(message="Use the image_caption workflow to generate an image with the text 'Platform Verified' displayed on it.")`
 3. Agency responds with result + `output_files`
-4. You send the output files to the user via `message(content="...", media=[...output_files])`
+4. You send output files to user via `message(content="...", media=[...output_files])`
 5. You ask: "Does this look correct?"
 6. User: "Looks good, approved"
 7. You call `workflow(message="finalize", session_id="sess_abc123")`
@@ -66,7 +92,7 @@ workflow(message="The file is located at C:\\Users\\...\\doc.pdf", session_id="s
 
 ## Important Rules
 
-1. **Always pass the user's intent clearly** — the agency agent reads workflow files and executes tools on its own.
+1. **Discover before guessing** — if you're not sure which workflow to use, call `list_workflows` first.
 2. **Always preserve the session_id** — every follow-up must use the same `session_id`.
 3. **ALWAYS send output files to the user** — use the `message` tool with `media` parameter before asking for approval.
 4. **Wait for user approval before finalizing** — never auto-finalize.
