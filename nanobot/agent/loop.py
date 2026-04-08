@@ -27,6 +27,7 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.agent.tools.admissions import RegisterInquiryTool, LogReceiptTool, GetAdmissionsSummaryTool, ResetAdmissionsTool
+from nanobot.agent.tools.workflow import WorkflowTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
@@ -260,6 +261,9 @@ class AgentLoop:
         self.tools.register(LogReceiptTool())
         self.tools.register(GetAdmissionsSummaryTool())
         self.tools.register(ResetAdmissionsTool())
+
+        # Register workflow agency tool
+        self.tools.register(WorkflowTool())
         
         if self.cron_service:
             self.tools.register(
