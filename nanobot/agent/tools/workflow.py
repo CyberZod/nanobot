@@ -51,7 +51,11 @@ class WorkflowTool(Tool):
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "The message to send to the workflow agency",
+                    "description": (
+                        "The message or action: a free-text message to the agency, "
+                        "or one of: 'execute', 'validate_inputs', 'list_workflows', 'finalize'. "
+                        "Defaults to 'execute' when workflow_name and inputs are provided."
+                    ),
                 },
                 "session_id": {
                     "type": "string",
@@ -60,21 +64,52 @@ class WorkflowTool(Tool):
                         "Omit or leave empty to start a new workflow session."
                     ),
                 },
+                "workflow_name": {
+                    "type": "string",
+                    "description": "Workflow name (for execute or validate_inputs)",
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "Input key-value pairs (for execute or validate_inputs)",
+                },
             },
-            "required": ["message"],
+            "required": [],
         }
 
     async def execute(
         self,
-        message: str,
+        message: str | None = None,
         session_id: str | None = None,
+        workflow_name: str | None = None,
+        inputs: dict | None = None,
         **kwargs: Any,
     ) -> str:
-        # Route to the right bridge action
+        # Infer action when message is missing
+        if not message and workflow_name and inputs:
+            message = "execute"
+        elif not message and workflow_name:
+            message = "validate_inputs"
+        elif not message:
+            return json.dumps({"error": "Provide a message or workflow_name + inputs"})
+
         msg_lower = message.strip().lower()
 
         if msg_lower == "list_workflows":
             request = {"action": "list_workflows"}
+        elif msg_lower == "validate_inputs":
+            request = {
+                "action": "validate_inputs",
+                "workflow_name": workflow_name or "",
+                "inputs": inputs or {},
+            }
+        elif msg_lower == "execute":
+            request = {
+                "action": "execute",
+                "workflow_name": workflow_name or "",
+                "inputs": inputs or {},
+                "log_dir": str(LOG_DIR),
+                "user_id": "nanobot",
+            }
         elif msg_lower == "finalize" and session_id:
             request = {
                 "action": "finalize",

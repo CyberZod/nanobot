@@ -38,14 +38,67 @@ Each workflow has a `name`, `description`, and `inputs` (with `required` flag an
 - If the user says "generate an image" → that's likely `image_caption`
 - If unsure, list workflows and ask the user which one they want
 
-## Executing a Workflow
+## Validating Inputs Before Execution
 
-### Starting a new workflow
-
-Call `workflow` with a clear instruction. The agency agent will discover and execute the right workflow on its own. Include the workflow name if you know it.
+Before starting a workflow, validate the user's inputs to catch issues early (missing inputs, wrong file types, files not found):
 
 ```
-workflow(message="Use the image_caption workflow to generate an image with the text 'Hello World' displayed on it.")
+workflow(message="validate_inputs", workflow_name="doc_mutation", inputs={"Document": "C:\\path\\to\\file.pdf", "Instructions": "change the date"})
+```
+
+Response when valid:
+```json
+{"valid": true, "inputs": {"Document": {"value": "...", "file_meta": {"type": "pdf", "pages": 3, "size": "245 KB"}}, ...}}
+```
+
+Response when invalid:
+```json
+{"valid": false, "missing": [{"name": "Document", "description": "Path to the input document"}], "errors": ["Missing required input: Document"]}
+```
+
+**When to validate:**
+- ALWAYS validate before starting a workflow that takes file inputs
+- If validation fails, tell the user what's wrong and ask them to fix it
+- If a file type doesn't match (e.g., user sent a JPEG but workflow needs PDF), tell them specifically what's needed
+- Once validation passes, proceed to execute the workflow
+
+**Collecting inputs from the user:**
+- Use `list_workflows` to know what inputs are needed
+- If the user provides a file, use the file path from the `media` array in their message
+- If inputs are missing, ask the user for them before validating
+- You may need to go back and forth with the user until all inputs are valid
+
+## Executing a Workflow
+
+### Starting a workflow (preferred — with built-in validation)
+
+Use the `execute` action with `workflow_name` and `inputs`. This validates inputs first — if anything is wrong, it returns errors without starting the workflow. If inputs are valid, it executes automatically.
+
+```
+workflow(message="execute", workflow_name="image_caption", inputs={"Message": "Hello World"})
+```
+
+```
+workflow(message="execute", workflow_name="doc_mutation", inputs={"Document": "C:\\path\\to\\file.pdf", "Instructions": "change the date to March 2026"})
+```
+
+If validation fails:
+```json
+{"valid": false, "errors": ["Document: expected document or pdf, got image"]}
+```
+→ Tell the user what's wrong and ask them to fix it.
+
+If validation passes and execution completes:
+```json
+{"session_id": "sess_abc123", "response": "All steps complete! ...", "output_files": ["C:\\...\\image.png"]}
+```
+
+### Starting a workflow (free-form — no validation)
+
+You can also send a free-text message. The agency agent figures out which workflow to use on its own. Use this for simple requests or when you're just chatting with the agent.
+
+```
+workflow(message="Generate an image with the text 'Hello World' on it.")
 ```
 
 Response includes a `session_id` (for follow-ups) and optionally `output_files`:
