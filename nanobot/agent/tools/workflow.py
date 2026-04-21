@@ -40,8 +40,10 @@ class WorkflowTool(Tool):
     def description(self) -> str:
         return (
             "Send a message to the Maroc workflow agency to execute structured workflows. "
-            "Omit session_id on the first call to start a new workflow. "
-            "Pass the same session_id for follow-up messages (e.g., approvals)."
+            "Typical flow: validate_inputs -> execute -> preview (show user for approval) -> "
+            "finalize (after approval). Use free-text messages with session_id to pass user "
+            "feedback/iterations in between. Omit session_id on the first call; pass the "
+            "returned session_id on every follow-up."
         )
 
     @property
@@ -53,7 +55,7 @@ class WorkflowTool(Tool):
                     "type": "string",
                     "description": (
                         "The message or action: a free-text message to the agency, "
-                        "or one of: 'execute', 'validate_inputs', 'list_workflows', 'finalize'. "
+                        "or one of: 'execute', 'validate_inputs', 'list_workflows', 'preview', 'finalize'. "
                         "Defaults to 'execute' when workflow_name and inputs are provided."
                     ),
                 },
@@ -108,6 +110,12 @@ class WorkflowTool(Tool):
                 "workflow_name": workflow_name or "",
                 "inputs": inputs or {},
                 "log_dir": str(LOG_DIR),
+                "user_id": "nanobot",
+            }
+        elif msg_lower == "preview" and session_id:
+            request = {
+                "action": "preview",
+                "session_id": session_id,
                 "user_id": "nanobot",
             }
         elif msg_lower == "finalize" and session_id:
