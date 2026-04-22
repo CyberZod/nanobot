@@ -31,6 +31,8 @@ class WorkflowTool(Tool):
     def __init__(self) -> None:
         # Track session IDs so we can pass them on follow-ups
         self._active_sessions: set[str] = set()
+        # Track sessions where preview has been shown — required before finalize
+        self._previewed_sessions: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -119,6 +121,15 @@ class WorkflowTool(Tool):
                 "user_id": "nanobot",
             }
         elif msg_lower == "finalize" and session_id:
+            if session_id not in self._previewed_sessions:
+                return json.dumps({
+                    "error": (
+                        "finalize requires preview first. Call `preview` with this "
+                        "session_id, show the user the outputs, and only call `finalize` "
+                        "after the user explicitly approves (e.g. 'yes', 'go ahead')."
+                    ),
+                    "session_id": session_id,
+                })
             request = {
                 "action": "finalize",
                 "session_id": session_id,
@@ -185,6 +196,9 @@ class WorkflowTool(Tool):
         sid = result.get("session_id", "")
         if sid:
             self._active_sessions.add(sid)
+            # Record successful preview so finalize gate unlocks
+            if msg_lower == "preview" and not result.get("error"):
+                self._previewed_sessions.add(sid)
 
         logger.info(
             "Workflow bridge responded (session={})",
