@@ -24,15 +24,23 @@ AGENCY_PYTHON = AGENCY_PATH / ".venv" / "Scripts" / "python.exe"
 LOG_DIR = Path.home() / ".nanobot" / "workspace" / "workflow_logs"
 MEDIA_DIR = Path.home() / ".nanobot" / "media" / "workflow_outputs"
 
+# Fixed heads-up sent to the user on the first execute call of a new workflow.
+# Workflows can take a while; the user should know work has started without
+# getting a stream of internal-reasoning updates from the agent in between.
+START_ANNOUNCEMENT = "On it — I'll let you know once it's ready, and ping you if I need anything."
+
 
 class WorkflowTool(Tool):
     """Send messages to the Maroc workflow agency to execute workflows."""
 
-    def __init__(self) -> None:
+    def __init__(self, tools: Any = None) -> None:
         # Track session IDs so we can pass them on follow-ups
         self._active_sessions: set[str] = set()
         # Track sessions where preview has been shown — required before finalize
         self._previewed_sessions: set[str] = set()
+        # Optional ToolRegistry — used to look up the 'message' tool for the
+        # start announcement. Pass the agent loop's registry at construction.
+        self._tools = tools
 
     @property
     def name(self) -> str:
@@ -79,6 +87,29 @@ class WorkflowTool(Tool):
             },
             "required": [],
         }
+
+    async def _announce_start(self) -> None:
+        """
+        Send a fixed heads-up message to the user when a new workflow kicks off.
+
+        Uses the registered `message` tool (looked up on the shared
+        ToolRegistry passed at construction). Relies on the message tool's
+        default channel/chat_id ContextVars, which are set per-turn by the
+        agent loop — so no explicit routing info is needed here.
+
+        Non-fatal: if the message tool isn't available or the send fails, we
+        log and continue. The workflow still runs; the user just doesn't get
+        the heads-up.
+        """
+        if not self._tools:
+            return
+        msg_tool = self._tools.get("message")
+        if msg_tool is None:
+            return
+        try:
+            await msg_tool.execute(content=START_ANNOUNCEMENT)
+        except Exception as exc:
+            logger.warning("Workflow start announcement failed: {}", exc)
 
     async def execute(
         self,
@@ -146,6 +177,13 @@ class WorkflowTool(Tool):
 
         # Determine which Python to use
         python = str(AGENCY_PYTHON) if AGENCY_PYTHON.exists() else "python"
+
+        # First execute of a new workflow: send a fixed heads-up to the user
+        # now, before the bridge call blocks for potentially 1-3 minutes.
+        # This keeps the user informed without leaking the agent's internal
+        # reasoning (which is what sendProgress does when on).
+        if msg_lower == "execute" and not session_id:
+            await self._announce_start()
 
         logger.info(
             "Calling workflow bridge (session={})",

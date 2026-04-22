@@ -298,8 +298,9 @@ class AgentLoop:
         self.tools.register(GetAdmissionsSummaryTool())
         self.tools.register(ResetAdmissionsTool())
 
-        # Register workflow agency tool
-        self.tools.register(WorkflowTool())
+        # Register workflow agency tool — pass the registry so the tool can
+        # look up `message` for a fixed start-of-workflow announcement.
+        self.tools.register(WorkflowTool(tools=self.tools))
         
         if self.cron_service:
             self.tools.register(
