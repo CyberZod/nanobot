@@ -201,13 +201,17 @@ class WorkflowTool(Tool):
 
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=json.dumps(request).encode()),
-                timeout=300,  # 5 min max per turn
+                # 30 min: doc_mutation-class workflows need 8-15 min for a
+                # clean run and up to ~25 min when the agent iterates several
+                # times on judge-flagged artifacts. Earlier 5-min cap killed
+                # nearly every realistic run.
+                timeout=1800,
             )
 
         except asyncio.TimeoutError:
-            logger.error("Workflow bridge timed out (5 min)")
+            logger.error("Workflow bridge timed out (30 min)")
             proc.kill()
-            return json.dumps({"error": "Workflow timed out after 5 minutes"})
+            return json.dumps({"error": "Workflow timed out after 30 minutes"})
         except Exception as e:
             logger.error("Failed to run workflow bridge: {}", e)
             return json.dumps({"error": f"Bridge process error: {e}"})
