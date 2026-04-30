@@ -880,9 +880,14 @@ class AgentLoop:
         # suppressed just because MessageTool was used earlier in the turn.
         # However, if the turn falls back to the empty-final-response
         # placeholder, suppress it when the real user-visible output already
-        # came from MessageTool.
+        # came from MessageTool. We also suppress when the final reply is a
+        # verbatim repeat of what the tool already sent — common when the
+        # LLM restates the message-tool caption as its final assistant text
+        # (would land as a duplicate WhatsApp message otherwise).
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             if not had_injections or stop_reason == "empty_final_response":
+                return None
+            if mt._last_sent and final_content.strip() == mt._last_sent.strip():
                 return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content

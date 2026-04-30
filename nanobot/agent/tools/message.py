@@ -38,6 +38,11 @@ class MessageTool(Tool):
             default=default_message_id,
         )
         self._sent_in_turn_var: ContextVar[bool] = ContextVar("message_sent_in_turn", default=False)
+        # Tracks the content of the last send to the default target this turn.
+        # Used by the agent loop to suppress a verbatim-repeat final reply
+        # (the LLM sometimes restates the message tool's content as its final
+        # assistant message, which lands as a duplicate on WhatsApp).
+        self._last_sent_var: ContextVar[str] = ContextVar("message_last_sent", default="")
 
     def set_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Set the current message context."""
@@ -52,6 +57,7 @@ class MessageTool(Tool):
     def start_turn(self) -> None:
         """Reset per-turn send tracking."""
         self._sent_in_turn = False
+        self._last_sent = ""
 
     @property
     def _sent_in_turn(self) -> bool:
@@ -60,6 +66,14 @@ class MessageTool(Tool):
     @_sent_in_turn.setter
     def _sent_in_turn(self, value: bool) -> None:
         self._sent_in_turn_var.set(value)
+
+    @property
+    def _last_sent(self) -> str:
+        return self._last_sent_var.get()
+
+    @_last_sent.setter
+    def _last_sent(self, value: str) -> None:
+        self._last_sent_var.set(value)
 
     @property
     def name(self) -> str:
@@ -121,6 +135,7 @@ class MessageTool(Tool):
             await self._send_callback(msg)
             if channel == default_channel and chat_id == default_chat_id:
                 self._sent_in_turn = True
+                self._last_sent = content
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:

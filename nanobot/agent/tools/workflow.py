@@ -6,6 +6,7 @@ venv with its own dependencies. Communication is via JSON over stdin/stdout.
 
 import asyncio
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +25,23 @@ AGENCY_PYTHON = AGENCY_PATH / ".venv" / "Scripts" / "python.exe"
 LOG_DIR = Path.home() / ".nanobot" / "workspace" / "workflow_logs"
 MEDIA_DIR = Path.home() / ".nanobot" / "media" / "workflow_outputs"
 
-# Fixed heads-up sent to the user on the first execute call of a new workflow.
-# Workflows can take a while; the user should know work has started without
-# getting a stream of internal-reasoning updates from the agent in between.
-START_ANNOUNCEMENT = "On it — I'll let you know once it's ready, and ping you if I need anything."
+# Fallback heads-ups sent to the user before a (slow) workflow call.
+# The agent is expected to pass a tailored `user_facing_note` on execute and
+# feedback follow-ups; these pools are only used when the agent omits one. We
+# pick at random for variety so the user doesn't see the same canned line on
+# back-to-back runs.
+START_ANNOUNCEMENTS = [
+    "On it — I'll let you know once it's ready, and ping you if I need anything.",
+    "Got it — starting now, I'll send the result over shortly.",
+    "Sure thing — working on it, I'll be back with the result in a moment.",
+    "On it now — I'll send it through as soon as it's done.",
+]
+FOLLOWUP_ANNOUNCEMENTS = [
+    "Got it — working on the changes now.",
+    "On it — I'll send the updated version shortly.",
+    "Understood — making the changes now.",
+    "Sure — applying the changes, one moment.",
+]
 
 
 class WorkflowTool(Tool):
@@ -53,7 +67,10 @@ class WorkflowTool(Tool):
             "Typical flow: validate_inputs -> execute -> preview (show user for approval) -> "
             "finalize (after approval). Use free-text messages with session_id to pass user "
             "feedback/iterations in between. Omit session_id on the first call; pass the "
-            "returned session_id on every follow-up."
+            "returned session_id on every follow-up. "
+            "Always pass `user_facing_note` on `execute` and feedback follow-ups — a brief, "
+            "conversational heads-up sent to the user before the (slow) bridge call so they "
+            "know work has started."
         )
 
     @property
@@ -84,32 +101,48 @@ class WorkflowTool(Tool):
                     "type": "object",
                     "description": "Input key-value pairs (for execute or validate_inputs)",
                 },
+                "user_facing_note": {
+                    "type": "string",
+                    "description": (
+                        "Brief, user-facing acknowledgement sent to the user before this "
+                        "call runs. Required on `execute` (initial) and on free-text "
+                        "feedback follow-ups, both of which can block for 1-3 minutes. "
+                        "Plain conversational language addressed to the user — no internal "
+                        "reasoning, no tool names, no JSON, no 'I will…' planning narration. "
+                        "Examples: 'On it, I'll send the draft shortly.' / 'Got it — fixing "
+                        "the underline now.' / 'Reworking the totals, one moment.' "
+                        "Ignored for preview, finalize, validate_inputs, list_workflows."
+                    ),
+                },
             },
             "required": [],
         }
 
-    async def _announce_start(self) -> None:
+    async def _announce(self, text: str) -> str | None:
         """
-        Send a fixed heads-up message to the user when a new workflow kicks off.
+        Send a heads-up to the user before a slow bridge call.
 
         Uses the registered `message` tool (looked up on the shared
         ToolRegistry passed at construction). Relies on the message tool's
         default channel/chat_id ContextVars, which are set per-turn by the
         agent loop — so no explicit routing info is needed here.
 
-        Non-fatal: if the message tool isn't available or the send fails, we
-        log and continue. The workflow still runs; the user just doesn't get
-        the heads-up.
+        Returns the text on success, None if no message was sent (tool
+        unavailable, registry missing, or send failed). The caller uses the
+        return to decide whether to echo `announced_to_user` back to the
+        agent — only what actually reached the user gets recorded.
         """
         if not self._tools:
-            return
+            return None
         msg_tool = self._tools.get("message")
         if msg_tool is None:
-            return
+            return None
         try:
-            await msg_tool.execute(content=START_ANNOUNCEMENT)
+            await msg_tool.execute(content=text)
+            return text
         except Exception as exc:
-            logger.warning("Workflow start announcement failed: {}", exc)
+            logger.warning("Workflow announcement failed: {}", exc)
+            return None
 
     async def execute(
         self,
@@ -117,6 +150,7 @@ class WorkflowTool(Tool):
         session_id: str | None = None,
         workflow_name: str | None = None,
         inputs: dict | None = None,
+        user_facing_note: str | None = None,
         **kwargs: Any,
     ) -> str:
         # Infer action when message is missing
@@ -178,12 +212,21 @@ class WorkflowTool(Tool):
         # Determine which Python to use
         python = str(AGENCY_PYTHON) if AGENCY_PYTHON.exists() else "python"
 
-        # First execute of a new workflow: send a fixed heads-up to the user
-        # now, before the bridge call blocks for potentially 1-3 minutes.
-        # This keeps the user informed without leaking the agent's internal
-        # reasoning (which is what sendProgress does when on).
-        if msg_lower == "execute" and not session_id:
-            await self._announce_start()
+        # Heads-up to the user before the bridge blocks (1-3 min). Fires on
+        # initial execute and free-text feedback iterations; silent for fast
+        # calls (preview/finalize/validate_inputs/list_workflows). Prefers the
+        # agent-supplied `user_facing_note`; falls back to a randomly-picked
+        # string so the user still gets *something* if the agent forgets to
+        # pass one (and back-to-back runs don't see the identical line).
+        is_initial_execute = msg_lower == "execute" and not session_id
+        is_iteration = bool(session_id) and msg_lower not in {
+            "preview", "finalize", "validate_inputs", "list_workflows", "execute"
+        }
+        announced: str | None = None
+        if is_initial_execute or is_iteration:
+            pool = FOLLOWUP_ANNOUNCEMENTS if is_iteration else START_ANNOUNCEMENTS
+            text = user_facing_note or random.choice(pool)
+            announced = await self._announce(text)
 
         logger.info(
             "Calling workflow bridge (session={})",
@@ -246,5 +289,13 @@ class WorkflowTool(Tool):
             "Workflow bridge responded (session={})",
             sid,
         )
+
+        # Echo the heads-up that reached the user back into the tool response
+        # so the agent's conversation history records what was sent. Without
+        # this, an "Ok" reply to the announcement looks like an orphan to the
+        # agent (the announcement is sent server-side and never lands in the
+        # message log otherwise).
+        if announced is not None and isinstance(result, dict):
+            result["announced_to_user"] = announced
 
         return json.dumps(result)

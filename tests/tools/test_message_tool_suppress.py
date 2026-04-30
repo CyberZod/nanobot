@@ -123,6 +123,80 @@ class TestMessageToolSuppressLogic:
         assert sent[0].content == "Tool reply"
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_suppress_verbatim_repeat_after_injection(self, tmp_path: Path) -> None:
+        """
+        Mid-turn injections (e.g. user types 'OK' while a tool is running)
+        flip had_injections=True, which previously bypassed the suppress
+        check. But the LLM often restates the message-tool caption as its
+        final assistant text — that lands as a duplicate WhatsApp message.
+        Verbatim repeats should be suppressed even when had_injections=True.
+        """
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1", name="message",
+            arguments={"content": "Here's the file, sir.", "channel": "feishu", "chat_id": "chat123"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Here's the file, sir.", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        sent: list[OutboundMessage] = []
+        mt = loop.tools.get("message")
+        if isinstance(mt, MessageTool):
+            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+
+        pending_queue = asyncio.Queue()
+        await pending_queue.put(
+            InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="OK")
+        )
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
+        result = await loop._process_message(msg, pending_queue=pending_queue)
+
+        assert len(sent) == 1
+        assert sent[0].content == "Here's the file, sir."
+        assert result is None  # verbatim repeat suppressed despite injection
+
+    @pytest.mark.asyncio
+    async def test_no_suppress_distinct_reply_after_injection(self, tmp_path: Path) -> None:
+        """
+        When the final reply genuinely differs from the message tool's
+        content (e.g. it's actually addressing the injected user message),
+        it should NOT be suppressed.
+        """
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(
+            id="call1", name="message",
+            arguments={"content": "Here's the file.", "channel": "feishu", "chat_id": "chat123"},
+        )
+        calls = iter([
+            LLMResponse(content="", tool_calls=[tool_call]),
+            LLMResponse(content="Yes, I'm still here — anything else?", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        sent: list[OutboundMessage] = []
+        mt = loop.tools.get("message")
+        if isinstance(mt, MessageTool):
+            mt.set_send_callback(AsyncMock(side_effect=lambda m: sent.append(m)))
+
+        pending_queue = asyncio.Queue()
+        await pending_queue.put(
+            InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="You there?")
+        )
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Send")
+        result = await loop._process_message(msg, pending_queue=pending_queue)
+
+        assert len(sent) == 1
+        assert result is not None
+        assert "still here" in result.content
+
     async def test_progress_hides_internal_reasoning(self, tmp_path: Path) -> None:
         loop = _make_loop(tmp_path)
         tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
