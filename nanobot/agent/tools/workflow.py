@@ -7,6 +7,7 @@ venv with its own dependencies. Communication is via JSON over stdin/stdout.
 import asyncio
 import json
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -44,14 +45,22 @@ FOLLOWUP_ANNOUNCEMENTS = [
 ]
 
 
+@dataclass
+class _SessionMeta:
+    workflow_name: str | None = None
+    original_inputs: dict | None = None
+    previewed: bool = False
+    preview_outputs: dict | None = None
+
+
 class WorkflowTool(Tool):
     """Send messages to the Maroc workflow agency to execute workflows."""
 
     def __init__(self, tools: Any = None) -> None:
-        # Track session IDs so we can pass them on follow-ups
-        self._active_sessions: set[str] = set()
-        # Track sessions where preview has been shown — required before finalize
-        self._previewed_sessions: set[str] = set()
+        # Per-session metadata: workflow name + inputs from the originating
+        # execute call, whether preview has been shown (gates finalize), and
+        # the latest preview outputs. Downstream feedback logging reads this.
+        self._sessions: dict[str, _SessionMeta] = {}
         # Optional ToolRegistry — used to look up the 'message' tool for the
         # start announcement. Pass the agent loop's registry at construction.
         self._tools = tools
@@ -186,7 +195,8 @@ class WorkflowTool(Tool):
                 "user_id": "nanobot",
             }
         elif msg_lower == "finalize" and session_id:
-            if session_id not in self._previewed_sessions:
+            meta = self._sessions.get(session_id)
+            if meta is None or not meta.previewed:
                 return json.dumps({
                     "error": (
                         "finalize requires preview first. Call `preview` with this "
@@ -277,13 +287,21 @@ class WorkflowTool(Tool):
             logger.error("Bridge returned invalid JSON: {}", raw_output[:500])
             return json.dumps({"error": f"Invalid bridge response: {raw_output[:200]}"})
 
-        # Track session
+        # Track per-session metadata. Execute creates a fresh entry with the
+        # workflow name + original inputs (used downstream for feedback
+        # logging). Preview marks the session previewed (unlocks the finalize
+        # gate) and snapshots the bridge's resolved outputs dict.
         sid = result.get("session_id", "")
-        if sid:
-            self._active_sessions.add(sid)
-            # Record successful preview so finalize gate unlocks
-            if msg_lower == "preview" and not result.get("error"):
-                self._previewed_sessions.add(sid)
+        if sid and not result.get("error"):
+            if msg_lower == "execute":
+                self._sessions[sid] = _SessionMeta(
+                    workflow_name=workflow_name,
+                    original_inputs=inputs,
+                )
+            elif msg_lower == "preview":
+                meta = self._sessions.setdefault(sid, _SessionMeta())
+                meta.previewed = True
+                meta.preview_outputs = result.get("outputs")
 
         logger.info(
             "Workflow bridge responded (session={})",
