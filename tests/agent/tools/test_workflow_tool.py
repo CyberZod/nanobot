@@ -160,3 +160,168 @@ class TestSessionTracking:
         assert meta.workflow_name == "doc_mutation"
         assert meta.original_inputs == {"x": 1}
         assert meta.previewed is True
+
+
+class TestFeedbackHook:
+    """WorkflowTool routes correction events into FeedbackLogger correctly."""
+
+    @pytest.fixture
+    def mock_logger(self):
+        m = MagicMock()
+        m.log_rework = MagicMock(return_value=1)
+        m.mark_rework_outcome = MagicMock(return_value=True)
+        return m
+
+    @pytest.fixture
+    def tool_with_logger(self, mock_logger):
+        return WorkflowTool(tools=None, feedback_logger=mock_logger)
+
+    async def _arrive_at_post_preview(self, tool, mock_bridge):
+        """Bring a tool through execute → preview so a correction message has session metadata."""
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"file": "letter.pdf", "Instructions": "kindly->abeg"},
+        )
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "outputs": {
+                "modified_pdf": "/tmp/v1.pdf",
+                "summary": "Replaced kindly with abeg in 4 places",
+            },
+            "session_workdir": "/tmp/sess_abc",
+        })
+        await tool.execute(message="preview", session_id="sess_abc")
+
+    @pytest.mark.asyncio
+    async def test_correction_high_certainty_logs_open_then_close(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        await self._arrive_at_post_preview(tool_with_logger, mock_bridge)
+
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "final_message": "I've added the underline back on 'abeg'.",
+        })
+        await tool_with_logger.execute(
+            message="the underline is missing on 'abeg'",
+            session_id="sess_abc",
+            classification="correction",
+            classification_certainty="high",
+        )
+
+        # log_rework called once on the way in
+        assert mock_logger.log_rework.call_count == 1
+        log_kwargs = mock_logger.log_rework.call_args.kwargs
+        assert log_kwargs["workflow_name"] == "doc_mutation"
+        assert log_kwargs["session_id"] == "sess_abc"
+        assert log_kwargs["classification_certainty"] == "high"
+        assert log_kwargs["original_inputs"] == {
+            "file": "letter.pdf", "Instructions": "kindly->abeg",
+        }
+        assert log_kwargs["preview_summary"] == "Replaced kindly with abeg in 4 places"
+        assert log_kwargs["user_feedback"] == "the underline is missing on 'abeg'"
+
+        # mark_rework_outcome called once on the way out, succeeded=True
+        assert mock_logger.mark_rework_outcome.call_count == 1
+        close_kwargs = mock_logger.mark_rework_outcome.call_args.kwargs
+        assert close_kwargs["workflow_name"] == "doc_mutation"
+        assert close_kwargs["session_id"] == "sess_abc"
+        assert close_kwargs["succeeded"] is True
+        assert "underline" in close_kwargs["summary"]
+
+    @pytest.mark.asyncio
+    async def test_correction_low_certainty_skips_log(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        await self._arrive_at_post_preview(tool_with_logger, mock_bridge)
+
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool_with_logger.execute(
+            message="hmm, the styling looks off",
+            session_id="sess_abc",
+            classification="correction",
+            classification_certainty="low",
+        )
+
+        # Safety valve: low certainty drops the log entirely
+        assert mock_logger.log_rework.call_count == 0
+        assert mock_logger.mark_rework_outcome.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_extension_skips_log(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        await self._arrive_at_post_preview(tool_with_logger, mock_bridge)
+
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool_with_logger.execute(
+            message="can you also do this for page 2?",
+            session_id="sess_abc",
+            classification="extension",
+            classification_certainty="high",
+        )
+
+        # Extensions don't feed distillation
+        assert mock_logger.log_rework.call_count == 0
+        assert mock_logger.mark_rework_outcome.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_correction_without_session_metadata_skips_log(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        # No prior execute/preview on this tool instance — _sessions is empty
+        mock_bridge.set_response({"session_id": "sess_xyz", "status": "complete"})
+        await tool_with_logger.execute(
+            message="the underline is missing",
+            session_id="sess_xyz",
+            classification="correction",
+            classification_certainty="high",
+        )
+
+        # Can't safely populate workflow_name → skip rather than write a corrupt row
+        assert mock_logger.log_rework.call_count == 0
+        assert mock_logger.mark_rework_outcome.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_bridge_error_records_failed_outcome(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        await self._arrive_at_post_preview(tool_with_logger, mock_bridge)
+
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "error": "PyMuPDF render failed",
+        })
+        await tool_with_logger.execute(
+            message="the underline is missing on 'abeg'",
+            session_id="sess_abc",
+            classification="correction",
+            classification_certainty="high",
+        )
+
+        # Open event written on the way in
+        assert mock_logger.log_rework.call_count == 1
+        # Closed on the way out with succeeded=False
+        assert mock_logger.mark_rework_outcome.call_count == 1
+        close_kwargs = mock_logger.mark_rework_outcome.call_args.kwargs
+        assert close_kwargs["succeeded"] is False
+
+    @pytest.mark.asyncio
+    async def test_finalize_does_not_call_logger(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        await self._arrive_at_post_preview(tool_with_logger, mock_bridge)
+
+        mock_bridge.set_response({"session_id": "sess_abc", "finalized": True})
+        await tool_with_logger.execute(
+            message="finalize",
+            session_id="sess_abc",
+        )
+
+        # Finalize is a workflow action — prior rework already closed itself
+        assert mock_logger.log_rework.call_count == 0
+        assert mock_logger.mark_rework_outcome.call_count == 0
