@@ -59,20 +59,33 @@ class _SessionMeta:
     original_inputs: dict | None = None
     previewed: bool = False
     preview_outputs: dict | None = None
+    last_agent_response: str | None = None
 
 
 def _build_preview_summary(meta: _SessionMeta) -> str:
     """Distill a short text summary of what was shown to the user.
 
-    Prefers an explicit 'summary' value-output if the workflow author
-    declared one (cleanest signal for the distiller). Falls back to a
-    minimal placeholder so the field is never empty.
+    Two-source ladder, in priority order:
+      1. Workflow-declared 'summary' value-output (richest signal — opt-in by
+         the workflow author via the outputs schema).
+      2. The agent's final response text from the most-recent run, captured
+         on execute / message turns from the bridge's 'response' field.
+    If neither is available we warn and return empty — a structural smell
+    (bridge response shape unexpected, or session metadata lost) worth
+    surfacing in logs rather than silently writing a useless placeholder.
     """
     if meta.preview_outputs and isinstance(meta.preview_outputs, dict):
         s = meta.preview_outputs.get("summary")
-        if isinstance(s, str) and s:
-            return s
-    return f"Preview of {meta.workflow_name or 'unknown workflow'}"
+        if isinstance(s, str) and s.strip():
+            return s.strip()
+    if meta.last_agent_response and meta.last_agent_response.strip():
+        return meta.last_agent_response.strip()[:500]
+    logger.warning(
+        "preview_summary fallback hit for workflow={} — no declared 'summary' "
+        "output AND no captured agent response. Distiller will see empty.",
+        meta.workflow_name,
+    )
+    return ""
 
 
 class WorkflowTool(Tool):
@@ -380,18 +393,26 @@ class WorkflowTool(Tool):
         # Track per-session metadata. Execute creates a fresh entry with the
         # workflow name + original inputs (used downstream for feedback
         # logging). Preview marks the session previewed (unlocks the finalize
-        # gate) and snapshots the bridge's resolved outputs dict.
+        # gate) and snapshots the bridge's resolved outputs dict. Free-text
+        # rework turns refresh the captured agent response so the next
+        # correction's preview_summary reflects the latest output the user saw.
         sid = result.get("session_id", "")
         if sid and not result.get("error"):
             if msg_lower == "execute":
                 self._sessions[sid] = _SessionMeta(
                     workflow_name=workflow_name,
                     original_inputs=inputs,
+                    last_agent_response=result.get("response"),
                 )
             elif msg_lower == "preview":
                 meta = self._sessions.setdefault(sid, _SessionMeta())
                 meta.previewed = True
                 meta.preview_outputs = result.get("outputs")
+            elif msg_lower not in _ACTION_KEYWORDS:
+                meta = self._sessions.setdefault(sid, _SessionMeta())
+                meta.last_agent_response = (
+                    result.get("response") or meta.last_agent_response
+                )
 
         # Close the open feedback event recorded before the bridge call. The
         # rework's outcome is the bridge's success/failure; the summary is the
@@ -399,8 +420,7 @@ class WorkflowTool(Tool):
         if logged_meta and logged_meta.workflow_name and self._feedback_logger is not None:
             succeeded = not bool(result.get("error"))
             summary = (
-                result.get("final_message")
-                or result.get("message")
+                result.get("response")
                 or result.get("error")
                 or "rework completed"
             )

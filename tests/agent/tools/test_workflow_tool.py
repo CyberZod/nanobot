@@ -204,7 +204,7 @@ class TestFeedbackHook:
         mock_bridge.set_response({
             "session_id": "sess_abc",
             "status": "complete",
-            "final_message": "I've added the underline back on 'abeg'.",
+            "response": "I've added the underline back on 'abeg'.",
         })
         await tool_with_logger.execute(
             message="the underline is missing on 'abeg'",
@@ -325,3 +325,76 @@ class TestFeedbackHook:
         # Finalize is a workflow action — prior rework already closed itself
         assert mock_logger.log_rework.call_count == 0
         assert mock_logger.mark_rework_outcome.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_preview_summary_falls_back_to_agent_response(
+        self, tool_with_logger, mock_bridge, mock_logger,
+    ):
+        # Execute that does NOT include a "summary" field in outputs but
+        # does include the agent's "response" text.
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "response": "I created a draft with kindly replaced by abeg in 4 places.",
+        })
+        await tool_with_logger.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"file": "letter.pdf"},
+        )
+        # Preview returns outputs without a 'summary' key
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "outputs": {"modified_pdf": "/tmp/v1.pdf"},
+            "session_workdir": "/tmp/sess_abc",
+        })
+        await tool_with_logger.execute(message="preview", session_id="sess_abc")
+
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool_with_logger.execute(
+            message="the underline is missing",
+            session_id="sess_abc",
+            classification="correction",
+            classification_certainty="high",
+        )
+
+        assert mock_logger.log_rework.call_count == 1
+        log_kwargs = mock_logger.log_rework.call_args.kwargs
+        # Falls through path 1 (no summary in outputs) → path 2 (agent's response)
+        assert log_kwargs["preview_summary"] == (
+            "I created a draft with kindly replaced by abeg in 4 places."
+        )
+
+    @pytest.mark.asyncio
+    async def test_preview_summary_warns_when_neither_source_available(
+        self, tool_with_logger, mock_bridge, mock_logger, caplog,
+    ):
+        import logging
+        caplog.set_level(logging.WARNING)
+        # Execute response with NO 'response' field captured
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool_with_logger.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"file": "letter.pdf"},
+        )
+        # Preview without a 'summary' output
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "outputs": {"modified_pdf": "/tmp/v1.pdf"},
+        })
+        await tool_with_logger.execute(message="preview", session_id="sess_abc")
+
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool_with_logger.execute(
+            message="the underline is missing",
+            session_id="sess_abc",
+            classification="correction",
+            classification_certainty="high",
+        )
+
+        assert mock_logger.log_rework.call_count == 1
+        log_kwargs = mock_logger.log_rework.call_args.kwargs
+        assert log_kwargs["preview_summary"] == ""
