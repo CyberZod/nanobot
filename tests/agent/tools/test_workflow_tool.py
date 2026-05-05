@@ -16,9 +16,24 @@ import pytest
 from nanobot.agent.tools.workflow import WorkflowTool
 
 
+def _patch_default_note(t: WorkflowTool) -> WorkflowTool:
+    """Inject a default `user_facing_note` so existing tests focused on
+    other behavior don't need to thread the kwarg everywhere. The tool
+    requires it on slow paths (execute / free-text iterations) and
+    ignores it on fast actions (preview / finalize / etc.)."""
+    original = t.execute
+
+    async def patched(*args, **kwargs):
+        kwargs.setdefault("user_facing_note", "test note")
+        return await original(*args, **kwargs)
+
+    t.execute = patched  # type: ignore[method-assign]
+    return t
+
+
 @pytest.fixture
 def tool():
-    return WorkflowTool(tools=None)
+    return _patch_default_note(WorkflowTool(tools=None))
 
 
 class _MockBridge:
@@ -162,6 +177,66 @@ class TestSessionTracking:
         assert meta.previewed is True
 
 
+class TestUserFacingNoteEnforcement:
+    """Slow-path calls (execute / free-text iterations) require user_facing_note."""
+
+    @pytest.fixture
+    def raw_tool(self):
+        # Bypass the default-note injection in the `tool` fixture; this
+        # class needs to verify the enforcement itself.
+        return WorkflowTool(tools=None)
+
+    @pytest.mark.asyncio
+    async def test_initial_execute_without_note_returns_error(self, raw_tool):
+        # No mock_bridge needed — enforcement short-circuits before the
+        # bridge call, so the subprocess never runs.
+        result = await raw_tool.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"x": 1},
+        )
+        parsed = json.loads(result)
+        assert "user_facing_note" in parsed["error"]
+        assert "initial execute" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_iteration_without_note_returns_error(self, raw_tool, mock_bridge):
+        # Seed a session so the iteration path is reachable.
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await raw_tool.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"x": 1},
+            user_facing_note="On it.",
+        )
+        result = await raw_tool.execute(
+            message="add the underline",
+            session_id="sess_abc",
+        )
+        parsed = json.loads(result)
+        assert "user_facing_note" in parsed["error"]
+        assert "feedback follow-up" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_blank_note_treated_as_missing(self, raw_tool):
+        result = await raw_tool.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"x": 1},
+            user_facing_note="   ",
+        )
+        parsed = json.loads(result)
+        assert "user_facing_note" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_fast_actions_do_not_require_note(self, raw_tool, mock_bridge):
+        # preview, finalize, validate_inputs, list_workflows must all work
+        # without a note (they're synchronous-feeling and need no heads-up).
+        mock_bridge.set_response({"workflows": []})
+        result = await raw_tool.execute(message="list_workflows")
+        assert "error" not in json.loads(result) or "user_facing_note" not in json.loads(result).get("error", "")
+
+
 class TestFeedbackHook:
     """WorkflowTool routes correction events into FeedbackLogger correctly."""
 
@@ -174,7 +249,9 @@ class TestFeedbackHook:
 
     @pytest.fixture
     def tool_with_logger(self, mock_logger):
-        return WorkflowTool(tools=None, feedback_logger=mock_logger)
+        return _patch_default_note(
+            WorkflowTool(tools=None, feedback_logger=mock_logger)
+        )
 
     async def _arrive_at_post_preview(self, tool, mock_bridge):
         """Bring a tool through execute → preview so a correction message has session metadata."""

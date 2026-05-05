@@ -308,10 +308,29 @@ class WorkflowTool(Tool):
         is_iteration = bool(session_id) and msg_lower not in {
             "preview", "finalize", "validate_inputs", "list_workflows", "execute"
         }
+        # Enforce user_facing_note on slow paths. Returning an error here
+        # short-circuits before announcement, feedback logging, and the
+        # bridge call — the agent retries the same call with a note. We
+        # don't fall back to the canned pool on misses anymore because
+        # back-to-back canned lines (e.g. on a retry) read robotically
+        # and the agent can almost always do better with context.
+        if (is_initial_execute or is_iteration) and not (user_facing_note and user_facing_note.strip()):
+            kind = "feedback follow-up" if is_iteration else "initial execute"
+            return json.dumps({
+                "error": (
+                    f"`user_facing_note` is required on {kind} calls. "
+                    "Provide a brief, conversational heads-up addressed to the user "
+                    "(e.g. 'On it, I'll send the draft shortly.' / 'Got it — fixing "
+                    "the underline now.' / 'Hit a snag, retrying for you now.') and "
+                    "call again. Plain user-facing language only — no internal "
+                    "reasoning, no tool names, no JSON."
+                ),
+            })
         announced: str | None = None
         if is_initial_execute or is_iteration:
-            pool = FOLLOWUP_ANNOUNCEMENTS if is_iteration else START_ANNOUNCEMENTS
-            text = user_facing_note or random.choice(pool)
+            text = user_facing_note or random.choice(
+                FOLLOWUP_ANNOUNCEMENTS if is_iteration else START_ANNOUNCEMENTS
+            )
             announced = await self._announce(text)
 
         # Self-annealing capture (see SELF_ANNEALING_PLAN.md §7 Phase 1).

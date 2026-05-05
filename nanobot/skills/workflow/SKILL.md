@@ -132,6 +132,28 @@ If the agency needs more information, relay to the user. Pass their reply back w
 workflow(message="The file is at C:\\Users\\...\\doc.pdf", session_id="sess_abc123")
 ```
 
+### Heads-up to the user (`user_facing_note`)
+
+`execute` and free-text feedback follow-ups can block for 1-3 minutes while the bridge runs. **You MUST pass `user_facing_note`** on these calls — a brief, conversational acknowledgement that gets sent to the user before the bridge call starts so they know work has started and aren't waiting in silence.
+
+The tool will reject the call with an error if `user_facing_note` is missing on these paths; you'll need to retry with one.
+
+```
+workflow(message="execute", workflow_name="doc_mutation", inputs={...},
+         user_facing_note="On it, I'll send the modified document shortly.")
+```
+
+```
+workflow(message="Underline 'To' in the heading", session_id="sess_abc123",
+         user_facing_note="Got it — fixing the underline now.")
+```
+
+**Rules for `user_facing_note`:**
+- Plain conversational language addressed directly to the user. No internal reasoning, no tool names, no JSON, no "I will…" planning narration.
+- Tailor it to the situation. On a retry after a failure, say so ("Hit a snag, retrying for you now.") — don't reuse the same line as the first attempt.
+- Keep it short — one sentence.
+- Skip on `preview`, `finalize`, `validate_inputs`, `list_workflows` (those are fast, no heads-up needed).
+
 ## Complete Flow Example
 
 1. User: "Generate an image with the text 'Platform Verified'"
@@ -150,3 +172,4 @@ workflow(message="The file is at C:\\Users\\...\\doc.pdf", session_id="sess_abc1
 3. **ALWAYS send output files to the user** — use the `message` tool with `media` parameter before asking for approval.
 4. **Wait for user approval before finalizing** — never auto-finalize.
 5. **Only YOU finalize workflows** — the agency cannot do this. You must call `workflow(message="finalize", session_id="...")` after approval.
+6. **Always pass `user_facing_note` on `execute` and feedback follow-ups** — these block for 1-3 minutes; the user needs a tailored heads-up. Tailor it to the situation (especially on retries).
