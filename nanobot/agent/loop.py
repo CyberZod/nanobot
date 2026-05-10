@@ -31,8 +31,7 @@ from nanobot.agent.tools.self import MyTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.agent.tools.admissions import RegisterInquiryTool, LogReceiptTool, GetAdmissionsSummaryTool, ResetAdmissionsTool
-from nanobot.agent.feedback import FeedbackLogger
-from nanobot.agent.tools.workflow import FEEDBACK_DIR, WorkflowTool
+from nanobot.agent.tools.workflow import WorkflowTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
@@ -300,13 +299,8 @@ class AgentLoop:
         self.tools.register(ResetAdmissionsTool())
 
         # Register workflow agency tool — pass the registry so the tool can
-        # look up `message` for a fixed start-of-workflow announcement, and
-        # the feedback logger so post-preview corrections are captured for
-        # self-annealing (see SELF_ANNEALING_PLAN.md).
-        self.tools.register(WorkflowTool(
-            tools=self.tools,
-            feedback_logger=FeedbackLogger(FEEDBACK_DIR),
-        ))
+        # look up `message` for a fixed start-of-workflow announcement.
+        self.tools.register(WorkflowTool(tools=self.tools))
         
         if self.cron_service:
             self.tools.register(

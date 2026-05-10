@@ -17,7 +17,6 @@ except ImportError:
     import logging
     logger = logging.getLogger("workflow_tool")
 
-from nanobot.agent.feedback import FeedbackLogger
 from nanobot.agent.tools.base import Tool
 
 # Maroc agency paths — hardcoded for Phase 1
@@ -26,10 +25,10 @@ BRIDGE_SCRIPT = AGENCY_PATH / "workflow_bridge.py"
 AGENCY_PYTHON = AGENCY_PATH / ".venv" / "Scripts" / "python.exe"
 LOG_DIR = Path.home() / ".nanobot" / "workspace" / "workflow_logs"
 MEDIA_DIR = Path.home() / ".nanobot" / "media" / "workflow_outputs"
-FEEDBACK_DIR = Path.home() / ".nanobot" / "workspace" / "feedback_logs"
 
 # Action keywords that route to the bridge as workflow actions, not free-text
-# messages. Used to gate the feedback hook to message-branch calls only.
+# messages. Used by both the user-facing-note enforcement gate and the
+# session-tracking branch that captures the latest agent response.
 _ACTION_KEYWORDS = frozenset({
     "execute", "preview", "finalize", "validate_inputs", "list_workflows",
 })
@@ -62,50 +61,17 @@ class _SessionMeta:
     last_agent_response: str | None = None
 
 
-def _build_preview_summary(meta: _SessionMeta) -> str:
-    """Distill a short text summary of what was shown to the user.
-
-    Two-source ladder, in priority order:
-      1. Workflow-declared 'summary' value-output (richest signal — opt-in by
-         the workflow author via the outputs schema).
-      2. The agent's final response text from the most-recent run, captured
-         on execute / message turns from the bridge's 'response' field.
-    If neither is available we warn and return empty — a structural smell
-    (bridge response shape unexpected, or session metadata lost) worth
-    surfacing in logs rather than silently writing a useless placeholder.
-    """
-    if meta.preview_outputs and isinstance(meta.preview_outputs, dict):
-        s = meta.preview_outputs.get("summary")
-        if isinstance(s, str) and s.strip():
-            return s.strip()
-    if meta.last_agent_response and meta.last_agent_response.strip():
-        return meta.last_agent_response.strip()[:500]
-    logger.warning(
-        "preview_summary fallback hit for workflow={} — no declared 'summary' "
-        "output AND no captured agent response. Distiller will see empty.",
-        meta.workflow_name,
-    )
-    return ""
-
-
 class WorkflowTool(Tool):
     """Send messages to the Maroc workflow agency to execute workflows."""
 
-    def __init__(
-        self,
-        tools: Any = None,
-        feedback_logger: FeedbackLogger | None = None,
-    ) -> None:
+    def __init__(self, tools: Any = None) -> None:
         # Per-session metadata: workflow name + inputs from the originating
-        # execute call, whether preview has been shown (gates finalize), and
-        # the latest preview outputs. The feedback hook reads this.
+        # execute call, whether preview has been shown (gates finalize), the
+        # latest preview outputs, and the latest agent response text.
         self._sessions: dict[str, _SessionMeta] = {}
         # Optional ToolRegistry — used to look up the 'message' tool for the
         # start announcement. Pass the agent loop's registry at construction.
         self._tools = tools
-        # When set, free-text correction messages are recorded for self-
-        # annealing (see SELF_ANNEALING_PLAN.md). None = logging disabled.
-        self._feedback_logger = feedback_logger
 
     @property
     def name(self) -> str:
@@ -121,11 +87,7 @@ class WorkflowTool(Tool):
             "returned session_id on every follow-up. "
             "Always pass `user_facing_note` on `execute` and feedback follow-ups — a brief, "
             "conversational heads-up sent to the user before the (slow) bridge call so they "
-            "know work has started. "
-            "On free-text follow-ups after a preview, also pass `classification` "
-            "(correction|extension) and `classification_certainty` (high|medium|low). "
-            "If user feedback is ambiguous, ask a clarifying question first (do NOT call "
-            "this tool); only call once intent is clear."
+            "know work has started."
         )
 
     @property
@@ -169,34 +131,6 @@ class WorkflowTool(Tool):
                         "Ignored for preview, finalize, validate_inputs, list_workflows."
                     ),
                 },
-                "classification": {
-                    "type": "string",
-                    "enum": ["correction", "extension"],
-                    "description": (
-                        "Set ONLY on free-text follow-up messages after a preview, when you "
-                        "judge what the user is asking for. "
-                        "'correction' = user is pointing to a defect or misalignment with "
-                        "their original intent. "
-                        "'extension' = user wants additional/different work, NOT a defect "
-                        "in the existing output. "
-                        "When intent is ambiguous, ask a clarifying question first (do NOT "
-                        "call this tool) and only set classification once intent is clear. "
-                        "When the user clearly approves (e.g. 'looks good', 'ship it'), "
-                        "call action='finalize' instead. "
-                        "Omit on initial execute and on workflow-action calls."
-                    ),
-                },
-                "classification_certainty": {
-                    "type": "string",
-                    "enum": ["high", "medium", "low"],
-                    "description": (
-                        "Required alongside `classification`. Your self-reported certainty. "
-                        "'low' means a best-guess — the system still runs the rework but "
-                        "won't add the event to its learning corpus. Prefer asking a "
-                        "clarifying question to upgrade certainty rather than logging a "
-                        "low-certainty guess."
-                    ),
-                },
             },
             "required": [],
         }
@@ -234,8 +168,6 @@ class WorkflowTool(Tool):
         workflow_name: str | None = None,
         inputs: dict | None = None,
         user_facing_note: str | None = None,
-        classification: str | None = None,
-        classification_certainty: str | None = None,
         **kwargs: Any,
     ) -> str:
         # Infer action when message is missing
@@ -333,33 +265,6 @@ class WorkflowTool(Tool):
             )
             announced = await self._announce(text)
 
-        # Self-annealing capture (see SELF_ANNEALING_PLAN.md §7 Phase 1).
-        # Decide whether this turn is a loggable correction; if so, write an
-        # OPEN event before the bridge runs so the user's feedback survives a
-        # mid-bridge crash. The same `logged_meta` is used after the bridge
-        # returns to close the event with success/failure + a summary.
-        is_logged_correction = (
-            self._feedback_logger is not None
-            and msg_lower not in _ACTION_KEYWORDS
-            and bool(session_id)
-            and classification == "correction"
-            and classification_certainty in ("high", "medium")
-        )
-        logged_meta: _SessionMeta | None = None
-        if is_logged_correction:
-            meta = self._sessions.get(session_id or "")
-            if meta and meta.workflow_name:
-                assert self._feedback_logger is not None  # narrowed by gate
-                self._feedback_logger.log_rework(
-                    workflow_name=meta.workflow_name,
-                    session_id=session_id or "",
-                    classification_certainty=classification_certainty,  # type: ignore[arg-type]
-                    original_inputs=meta.original_inputs or {},
-                    preview_summary=_build_preview_summary(meta),
-                    user_feedback=message or "",
-                )
-                logged_meta = meta
-
         logger.info(
             "Calling workflow bridge (session={})",
             session_id or "new",
@@ -410,11 +315,10 @@ class WorkflowTool(Tool):
             return json.dumps({"error": f"Invalid bridge response: {raw_output[:200]}"})
 
         # Track per-session metadata. Execute creates a fresh entry with the
-        # workflow name + original inputs (used downstream for feedback
-        # logging). Preview marks the session previewed (unlocks the finalize
-        # gate) and snapshots the bridge's resolved outputs dict. Free-text
-        # rework turns refresh the captured agent response so the next
-        # correction's preview_summary reflects the latest output the user saw.
+        # workflow name + original inputs. Preview marks the session previewed
+        # (unlocks the finalize gate) and snapshots the bridge's resolved
+        # outputs dict. Free-text rework turns refresh the captured agent
+        # response.
         sid = result.get("session_id", "")
         if sid and not result.get("error"):
             if msg_lower == "execute":
@@ -432,23 +336,6 @@ class WorkflowTool(Tool):
                 meta.last_agent_response = (
                     result.get("response") or meta.last_agent_response
                 )
-
-        # Close the open feedback event recorded before the bridge call. The
-        # rework's outcome is the bridge's success/failure; the summary is the
-        # agent's last response text (truncated). Distillers read both.
-        if logged_meta and logged_meta.workflow_name and self._feedback_logger is not None:
-            succeeded = not bool(result.get("error"))
-            summary = (
-                result.get("response")
-                or result.get("error")
-                or "rework completed"
-            )
-            self._feedback_logger.mark_rework_outcome(
-                workflow_name=logged_meta.workflow_name,
-                session_id=session_id or "",
-                succeeded=succeeded,
-                summary=str(summary)[:500],
-            )
 
         logger.info(
             "Workflow bridge responded (session={})",
