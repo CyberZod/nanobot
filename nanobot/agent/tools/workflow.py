@@ -60,6 +60,12 @@ class _SessionMeta:
     previewed: bool = False
     preview_outputs: dict | None = None
     last_agent_response: str | None = None
+    # Last status reported by the bridge for this session. One of
+    # 'success' | 'failed' | 'in_progress'. Set on execute/free-text
+    # turns and on preview; used to inform downstream decisions (e.g.,
+    # whether a 'failed' outcome should be surfaced honestly to the
+    # user instead of presented as a successful result).
+    last_status: str | None = None
 
 
 class WorkflowTool(Tool):
@@ -92,7 +98,27 @@ class WorkflowTool(Tool):
             "On `finalize`, you MAY pass `reflection_prompt` — a contextual prompt asking "
             "the workflow agent to reflect on what it just did. Send one whenever the "
             "session had friction (user corrections, retries, or a failed outcome); skip "
-            "it on clean first-attempt successes."
+            "it on clean first-attempt successes. "
+            "\n\nResponses include a `status` field — read it first, do not treat any "
+            "successful JSON return as workflow success. Status values: "
+            "`success` — the workflow plan resolved cleanly (every step complete or "
+            "skipped). Proceed to preview, show the user the output, and finalize on "
+            "approval. "
+            "`failed` — the plan has at least one failed step. The workflow agent has "
+            "given an honest report in `response`. Do NOT present the partial result "
+            "as a success. Surface the failure to the user honestly (using the "
+            "`response` text), and either send a free-text follow-up to the workflow "
+            "agent to try a different angle, or finalize as failure if the user wants "
+            "to abandon. "
+            "`in_progress` — the plan is partially resolved; the workflow agent stopped "
+            "without finishing. If `response` looks like a question or a stuck-state "
+            "report, send a free-text follow-up message to probe (e.g., ask the agent "
+            "to clarify or to try a different approach) — your job is to apply judgment "
+            "and unstick it. Do NOT call preview/finalize yet; the workflow is not "
+            "ready for the user to approve. "
+            "In all cases, use the `response` text as your source of truth for what "
+            "happened on that turn — it's the workflow agent's narrative, treat it as "
+            "if a teammate handed you a status note."
         )
 
     @property
@@ -348,7 +374,8 @@ class WorkflowTool(Tool):
         # workflow name + original inputs. Preview marks the session previewed
         # (unlocks the finalize gate) and snapshots the bridge's resolved
         # outputs dict. Free-text rework turns refresh the captured agent
-        # response.
+        # response. Status (`success` | `failed` | `in_progress`) is captured
+        # on every bridge-reply turn so downstream calls can branch on it.
         sid = result.get("session_id", "")
         if sid and not result.get("error"):
             if msg_lower == "execute":
@@ -356,16 +383,21 @@ class WorkflowTool(Tool):
                     workflow_name=workflow_name,
                     original_inputs=inputs,
                     last_agent_response=result.get("response"),
+                    last_status=result.get("status"),
                 )
             elif msg_lower == "preview":
                 meta = self._sessions.setdefault(sid, _SessionMeta())
                 meta.previewed = True
                 meta.preview_outputs = result.get("outputs")
+                if result.get("status"):
+                    meta.last_status = result.get("status")
             elif msg_lower not in _ACTION_KEYWORDS:
                 meta = self._sessions.setdefault(sid, _SessionMeta())
                 meta.last_agent_response = (
                     result.get("response") or meta.last_agent_response
                 )
+                if result.get("status"):
+                    meta.last_status = result.get("status")
 
         logger.info(
             "Workflow bridge responded (session={})",
