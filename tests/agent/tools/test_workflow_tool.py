@@ -9,7 +9,7 @@ when a free-text correction lands on the message branch.
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -46,6 +46,9 @@ class _MockBridge:
     def __init__(self) -> None:
         self._next_response: dict = {}
         self._returncode: int = 0
+        # Most recent decoded request body the tool sent to the bridge.
+        # Tests use this to verify the request shape.
+        self.last_request: dict = {}
 
     def set_response(self, response: dict, *, returncode: int = 0) -> None:
         self._next_response = response
@@ -55,7 +58,17 @@ class _MockBridge:
         proc = MagicMock()
         proc.returncode = self._returncode
         stdout = (json.dumps(self._next_response) + "\n").encode("utf-8")
-        proc.communicate = AsyncMock(return_value=(stdout, b""))
+        outer = self
+
+        async def capture_communicate(input=None):
+            if input:
+                try:
+                    outer.last_request = json.loads(input.decode("utf-8"))
+                except Exception:
+                    outer.last_request = {}
+            return (stdout, b"")
+
+        proc.communicate = capture_communicate
         return proc
 
 
@@ -175,6 +188,83 @@ class TestSessionTracking:
         assert meta.workflow_name == "doc_mutation"
         assert meta.original_inputs == {"x": 1}
         assert meta.previewed is True
+
+
+class TestReflectionPromptThreading:
+    """Manager passes reflection_prompt on finalize; bridge request carries it.
+
+    Self-annealing capture (see SELF_ANNEALING_PLAN.md §3 + §5). The
+    WorkflowTool is a dumb relay for the manager's prompt — it does NOT
+    decide whether to reflect, just threads `reflection_prompt` and
+    `notes_dir` through to the bridge when finalize is called.
+    """
+
+    @pytest.mark.asyncio
+    async def test_finalize_with_reflection_prompt_threads_to_bridge(self, tool, mock_bridge):
+        # Set up a previewed session so finalize gate passes
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool.execute(message="execute", workflow_name="doc_mutation", inputs={})
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "outputs": {"modified_pdf": "/tmp/v1.pdf"},
+        })
+        await tool.execute(message="preview", session_id="sess_abc")
+
+        # Now finalize with a reflection prompt
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "outputs": {},
+            "reflection_note_written": True,
+        })
+        await tool.execute(
+            message="finalize",
+            session_id="sess_abc",
+            reflection_prompt="Reflect on what was non-obvious.",
+        )
+
+        # The bridge request should include the prompt + a notes_dir
+        req = mock_bridge.last_request
+        assert req.get("action") == "finalize"
+        assert req.get("reflection_prompt") == "Reflect on what was non-obvious."
+        assert req.get("notes_dir"), f"notes_dir missing from request: {req}"
+
+    @pytest.mark.asyncio
+    async def test_finalize_without_reflection_prompt_passes_empty(self, tool, mock_bridge):
+        # Set up a previewed session
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool.execute(message="execute", workflow_name="doc_mutation", inputs={})
+        mock_bridge.set_response({
+            "session_id": "sess_abc",
+            "status": "complete",
+            "outputs": {"modified_pdf": "/tmp/v1.pdf"},
+        })
+        await tool.execute(message="preview", session_id="sess_abc")
+
+        # Finalize without reflection_prompt
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool.execute(message="finalize", session_id="sess_abc")
+
+        req = mock_bridge.last_request
+        # Either absent or empty string — bridge skips reflection on falsy
+        assert not req.get("reflection_prompt")
+
+    @pytest.mark.asyncio
+    async def test_reflection_prompt_ignored_on_non_finalize_actions(self, tool, mock_bridge):
+        # Even if the manager passes reflection_prompt on execute (a bug),
+        # it should NOT be sent to the bridge for non-finalize actions.
+        mock_bridge.set_response({"session_id": "sess_abc", "status": "complete"})
+        await tool.execute(
+            message="execute",
+            workflow_name="doc_mutation",
+            inputs={"x": 1},
+            reflection_prompt="this should be ignored",
+        )
+
+        req = mock_bridge.last_request
+        assert req.get("action") == "execute"
+        assert "reflection_prompt" not in req or not req.get("reflection_prompt")
 
 
 class TestUserFacingNoteEnforcement:

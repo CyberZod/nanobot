@@ -25,6 +25,7 @@ BRIDGE_SCRIPT = AGENCY_PATH / "workflow_bridge.py"
 AGENCY_PYTHON = AGENCY_PATH / ".venv" / "Scripts" / "python.exe"
 LOG_DIR = Path.home() / ".nanobot" / "workspace" / "workflow_logs"
 MEDIA_DIR = Path.home() / ".nanobot" / "media" / "workflow_outputs"
+NOTES_DIR = Path.home() / ".nanobot" / "workspace" / "workflow_notes"
 
 # Action keywords that route to the bridge as workflow actions, not free-text
 # messages. Used by both the user-facing-note enforcement gate and the
@@ -87,7 +88,11 @@ class WorkflowTool(Tool):
             "returned session_id on every follow-up. "
             "Always pass `user_facing_note` on `execute` and feedback follow-ups — a brief, "
             "conversational heads-up sent to the user before the (slow) bridge call so they "
-            "know work has started."
+            "know work has started. "
+            "On `finalize`, you MAY pass `reflection_prompt` — a contextual prompt asking "
+            "the workflow agent to reflect on what it just did. Send one whenever the "
+            "session had friction (user corrections, retries, or a failed outcome); skip "
+            "it on clean first-attempt successes."
         )
 
     @property
@@ -131,6 +136,23 @@ class WorkflowTool(Tool):
                         "Ignored for preview, finalize, validate_inputs, list_workflows."
                     ),
                 },
+                "reflection_prompt": {
+                    "type": "string",
+                    "description": (
+                        "Used ONLY with action='finalize'. A contextual prompt you compose "
+                        "asking the workflow agent to reflect on what it just did. The "
+                        "agent's response is appended to a per-workflow notes file used "
+                        "later for distilling lessons. "
+                        "Send one whenever this session had friction (user corrections, "
+                        "judge re-iterations, or a failed outcome). Skip on clean "
+                        "first-attempt successes — those would dilute the notes corpus. "
+                        "Include in the prompt: the session's outcome, the user's "
+                        "verbatim feedback from any correction turns, brief tone signal "
+                        "if notable, and a request for mechanical reflection in "
+                        "operation-shaped framing (NOT checklist framing). "
+                        "Ignored on all other actions."
+                    ),
+                },
             },
             "required": [],
         }
@@ -168,6 +190,7 @@ class WorkflowTool(Tool):
         workflow_name: str | None = None,
         inputs: dict | None = None,
         user_facing_note: str | None = None,
+        reflection_prompt: str | None = None,
         **kwargs: Any,
     ) -> str:
         # Infer action when message is missing
@@ -219,6 +242,13 @@ class WorkflowTool(Tool):
                 "copy_to": str(MEDIA_DIR),
                 "user_id": "nanobot",
             }
+            # Self-annealing capture (SELF_ANNEALING_PLAN.md §3 + §5). The
+            # manager (this caller) decides whether to send a reflection
+            # prompt; we just thread it through with the notes directory.
+            # Skipped on non-finalize actions even if the agent passes one.
+            if reflection_prompt and reflection_prompt.strip():
+                request["reflection_prompt"] = reflection_prompt
+                request["notes_dir"] = str(NOTES_DIR)
         else:
             request = {
                 "message": message,
