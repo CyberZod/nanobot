@@ -35,53 +35,32 @@ This file documents non-obvious constraints and usage patterns.
 
 - Please refer to cron skill for usage.
 
-## workflow — Reflection Prompts on Finalize
+## workflow — `user_corrections` on Finalize
 
-When you call `workflow` with `action="finalize"`, decide whether to also pass
-a `reflection_prompt`. This is how the workflow system learns from
-friction-bearing sessions.
+When you call `workflow` with `action="finalize"`, supply
+`user_corrections` whenever the user pushed back during this session.
+The system uses this list to drive a structured reflection turn on the
+workflow agent and writes the result to a per-workflow learning corpus.
 
-**Send a reflection_prompt when ANY of these is true:**
+**`user_corrections` shape:** a list of the user's verbatim correction
+strings, one entry per rework round, in chronological order.
+
+Examples:
+- `["the underline is missing on 'abeg'"]`
+- `["the page numbers got shifted too", "and the date format changed"]`
+- `[]` or omitted entirely
+
+**Supply `user_corrections` when:**
 - The user pushed back with any kind of correction during the session
   (one or more rework rounds happened).
-- The workflow ended in failure or partial delivery.
-- The user expressed notable frustration, surprise, or multi-round patience.
 
-**Skip reflection_prompt when:**
-- The first preview came back clean and the user approved immediately with
-  no corrections — those would dilute the learning corpus.
+**Omit (or pass empty) when:**
+- The first preview came back clean and the user approved immediately
+  with no corrections — those would dilute the learning corpus.
 
-**What to include in the prompt:**
-- The session's outcome (succeeded / failed / abandoned).
-- The user's verbatim feedback text from each correction turn.
-- A brief tone signal if the user's reaction was notable.
-- A request for mechanical reflection in operation-shaped framing.
-  Mechanical: *"how the operation works at the implementation level."*
-  NOT checklist: *"things to look for next time"* — that's hint leakage.
-
-**Template you can adapt:**
-
-```
-This {workflow_name} session has been finalized by the user. Reflecting on
-the work you just did:
-
-- What did you actually change, and how?
-- What was non-obvious about the mechanics of this kind of operation that
-  another agent doing similar work might not naturally think about?
-- What did you initially miss that the user had to flag?
-
-(For context: the user's correction was "<verbatim feedback>", which you
-addressed in your second attempt.)
-
-Write a short paragraph (~150 words) of mechanical reflection. Frame in
-terms of how the operation works, not "look for X" checklists. Future runs
-of this workflow will read it as background context.
-```
-
-For failed sessions, substitute: *"This session ended without a successful
-finalize. Where did you hit a wall? What about this case made it harder
-than expected?"*
-
-The prompt becomes one more message in the workflow agent's session, so it
-has full memory of what it did — you're giving it the context only the user
-side has: the user's words, the tone, the outcome verdict.
+You don't need to manufacture entries to force reflection on failure —
+the system auto-reflects on failed workflows even without corrections.
+Your job is just to capture the user's actual words when they pushed
+back. Verbatim, in order. The system handles everything else
+(reflection prompt composition, scope validation, note writing) on
+its end.
