@@ -468,3 +468,57 @@ class TestExplicitActionParameter:
         assert "action" in parsed["error"].lower()
         assert "explode" in parsed["error"].lower()
 
+
+
+class TestFailedStatusGuidance:
+    """The tool description (read by the manager LLM as part of its tool
+    palette) must teach the one-retry-cap policy on `failed` status.
+
+    Failed workflows are turn-terminal at the GenAI side now — the
+    workflow agent stops working once any step fails. The manager's
+    response policy is also bounded: ONE substantively-different retry
+    via action='message' is OK; a second failure means preview + finalize
+    (no more retries). This test pins both pieces of guidance in the
+    description so a future refactor can't quietly drop them."""
+
+    def test_description_carries_one_retry_cap_for_failed_status(self):
+        tool = WorkflowTool(tools=None)
+        desc = tool.description
+
+        # Cap is explicit: ONE retry maximum.
+        has_one_retry_cap = (
+            "ONE follow-up" in desc
+            or "one follow-up" in desc.lower()
+            or "ONE" in desc
+        )
+        # Substantively different angle, not rewording the same task.
+        has_substantive_qualifier = (
+            "substantively" in desc.lower()
+            and "different" in desc.lower()
+        )
+        # Preview + finalize back-to-back (no user-approval pause on failure).
+        has_preview_finalize_path = (
+            "preview" in desc.lower()
+            and "finalize" in desc.lower()
+            and ("no user approval" in desc.lower() or "back-to-back" in desc.lower())
+        )
+        # User-facing softening of "failed" terminology.
+        has_softening_guidance = (
+            "softened" in desc.lower() or "softer" in desc.lower()
+            or "couldn't fully complete" in desc.lower()
+            or "ran into issues" in desc.lower()
+        )
+        # Explicit internal-vs-user-language distinction: pins the
+        # framing so a future edit can't accidentally let "failed"
+        # become user-facing language again.
+        has_internal_vs_user_distinction = (
+            "internal language" in desc.lower()
+            or "internal terminology" in desc.lower()
+            or "not user-facing" in desc.lower()
+        )
+
+        assert has_one_retry_cap, f"description missing one-retry cap: {desc[:500]!r}"
+        assert has_substantive_qualifier, f"description missing 'substantively different' qualifier"
+        assert has_preview_finalize_path, f"description missing preview+finalize back-to-back path"
+        assert has_softening_guidance, f"description missing user-facing softening guidance"
+        assert has_internal_vs_user_distinction, f"description missing internal-vs-user-language distinction"

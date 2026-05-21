@@ -189,7 +189,17 @@ The tool will reject the call with an error if `user_facing_note` is missing on 
 Every bridge reply includes a `status` field. Read it first — don't treat any successful JSON return as workflow success:
 
 - **`success`** — The plan resolved cleanly (every step complete or skipped). Proceed to `preview`, show the user, finalize on approval.
-- **`failed`** — At least one step failed. The workflow agent has given an honest report in `response`. Do NOT present the partial result as a success. Surface the failure to the user honestly (using the `response` text), and either send `action="message"` to try a different angle, or `action="finalize"` as failure if the user wants to abandon.
+- **`failed`** — At least one step failed. The workflow agent has given an honest report in `response`. Do NOT present the partial result as a success internally.
+
+  You MAY send ONE follow-up `action="message"` with a **substantively different** angle to try — escalation that genuinely changes the approach, not just rewording the same task. If you have no clear alternative, skip the retry; that's also fine.
+
+  Whether you skipped the retry OR your one retry also returned `failed`, don't try again. The workflow is over. **Failure doesn't get user approval** — you don't pause to ask "is this okay?" the way you do on a successful preview. Instead, close out the run in one motion:
+
+  1. `action="preview"` to capture whatever outputs the earlier completed steps did produce.
+  2. `action="finalize"` immediately after — moves outputs to their permanent location, cleans up the session, writes a reflection note for learning.
+  3. Deliver the outputs returned in finalize's response to the user via the `message` tool, together with an honest user-facing summary.
+
+  **User-facing language matters here.** "Failed" is internal terminology — soften it when speaking to the user. Use phrases like "couldn't fully complete the workflow," "ran into issues finishing this one," "wasn't able to wrap up all the steps" — describe what happened in plain terms and tell them what DID get produced ("here's what got done so far"). Don't editorialize ("the workflow failed badly"), don't catastrophize, don't apologize repeatedly. The user just needs an accurate picture of where things stand and access to whatever artifacts the earlier steps produced.
 - **`in_progress`** — The plan is partially resolved; the workflow agent stopped without finishing. If `response` looks like a question or stuck-state report, send `action="message"` to probe (e.g., ask the agent to clarify or to try a different approach). Do NOT call `preview`/`finalize` yet.
 
 Use the `response` text as your source of truth for what happened on that turn — it's the workflow agent's narrative, treat it as if a teammate handed you a status note.
