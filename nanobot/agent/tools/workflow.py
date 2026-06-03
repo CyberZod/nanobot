@@ -103,16 +103,42 @@ class WorkflowTool(Tool):
             "Use this for rework after the user reviewed a preview.\n"
             "  - `preview`: read the current declared outputs of a session. "
             "Pass `session_id`. Use before showing the user a result.\n"
-            "  - `finalize`: deliver outputs and clean up the session. Pass "
+            "  - `finalize`: deliver outputs and checkpoint the session. Pass "
             "`session_id` (preview must have been called first). MAY pass "
             "`user_corrections` (verbatim strings from each rework round) "
-            "when the session had friction.\n"
+            "when the session had friction. Finalize is a checkpoint, not a "
+            "teardown — if the user later pushes back on the delivered "
+            "outputs, sending another `message` to the same session_id "
+            "silently reopens it for another rework round. The session ages "
+            "out only when no new messages arrive for the TTL window (7d).\n"
             "  - `validate_inputs`: dry-run input validation. Pass "
             "`workflow_name` + `inputs`.\n"
             "  - `list_workflows`: enumerate available workflows.\n\n"
             "Typical flow: `validate_inputs` -> `execute` -> `preview` (show "
             "the user) -> optionally `message` rework rounds -> `finalize` "
-            "after approval.\n\n"
+            "after approval. If the user later finds an issue with the "
+            "delivered outputs, repeat from `message` on the SAME session_id: "
+            "another rework round, then `preview` to show the new state, "
+            "then `finalize` again — carrying ONLY that round's corrections "
+            "in `user_corrections`, not a cumulative list across rounds.\n\n"
+            "When the user gives feedback after a finalize, disambiguate "
+            "before choosing an action:\n"
+            "  * Push-back on THIS session's deliverables (e.g., 'the cards "
+            "are shells', 'page 3 has a typo', 'the totals are wrong', "
+            "'try again with X tweaked') → REACTIVATE: action='message' "
+            "with the same session_id. Same workflow, same artifact, "
+            "refinement round.\n"
+            "  * A new piece of work (e.g., 'run job_search again with "
+            "different keywords', 'generate another image of X', 'do the "
+            "same for these other files') → FRESH RUN: action='execute' "
+            "with a new workflow_name + inputs. Different intent or "
+            "substantively different inputs.\n"
+            "  * A different operation entirely (e.g., 'now email these "
+            "PDFs', 'summarize what we did') → probably not a workflow "
+            "call at all; use the appropriate other tool.\n"
+            "When in doubt between reactivate-vs-fresh, lean reactivate: "
+            "a misrouted reactivation only adds a refinement turn the user "
+            "can correct; a misrouted fresh run wastes a full pipeline.\n\n"
             "`user_facing_note` is REQUIRED on `execute` and `message` (slow "
             "calls that block 1-3 minutes); ignored on the fast actions. "
             "Plain conversational language addressed to the user — no "
@@ -157,7 +183,7 @@ class WorkflowTool(Tool):
                         "'execute' starts a new run (needs workflow_name + inputs). "
                         "'message' sends free-text feedback to an ongoing session "
                         "(needs session_id + message). "
-                        "'preview'/'finalize' read/close a session (need session_id). "
+                        "'preview'/'finalize' read/checkpoint a session (need session_id). "
                         "'validate_inputs' is a dry-run check (needs workflow_name + "
                         "inputs). 'list_workflows' enumerates available workflows."
                     ),
@@ -213,10 +239,18 @@ class WorkflowTool(Tool):
                     "items": {"type": "string"},
                     "description": (
                         "Used ONLY with action='finalize'. A list of the user's "
-                        "verbatim correction strings from this session — one "
-                        "entry per rework round, in chronological order. Supply "
-                        "when the user pushed back during the session (e.g., "
-                        "'the underline is missing', 'the page numbers shifted'). "
+                        "verbatim correction strings from THIS finalize round — "
+                        "one entry per rework cycle within the round, in "
+                        "chronological order. Supply when the user pushed back "
+                        "during the round (e.g., 'the underline is missing', "
+                        "'the page numbers shifted'). "
+                        "On multi-finalize sessions (where the user comes back "
+                        "post-finalize with new feedback and you reopen via "
+                        "another `message` call), each finalize round carries "
+                        "ONLY that round's corrections — earlier rounds were "
+                        "already reflected at their own finalize. Don't pass "
+                        "a cumulative list across rounds; that re-feeds "
+                        "already-processed feedback. "
                         "The system uses this list to compose a reflection "
                         "prompt for the workflow agent and append the agent's "
                         "reflection to a per-workflow notes file. "
@@ -504,6 +538,15 @@ class WorkflowTool(Tool):
                 )
                 if result.get("status"):
                     meta.last_status = result.get("status")
+                # New work invalidates the prior preview — the user hasn't
+                # seen what the agent just produced. The next finalize must
+                # require a fresh preview. Matters both for in-session
+                # refinement rounds AND for post-finalize reopens (the
+                # bridge silently reopens a finalized session on the next
+                # message; the round-2 finalize gate must still enforce
+                # user review of round-2's work, not pass on round-1's
+                # stale preview flag).
+                meta.previewed = False
 
         logger.info(
             "Workflow bridge responded (session={})",
