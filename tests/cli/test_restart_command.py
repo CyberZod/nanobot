@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.events import InboundMessage
 from nanobot.providers.base import LLMResponse
 
 
@@ -30,15 +30,6 @@ def _make_loop():
          patch("nanobot.agent.loop.SubagentManager"):
         loop = AgentLoop(bus=bus, provider=provider, workspace=workspace)
     return loop, bus
-
-
-async def _wait_until(predicate, *, timeout: float = 0.2, interval: float = 0.01) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(interval)
-    assert predicate()
 
 
 class TestRestartCommand:
@@ -91,13 +82,29 @@ class TestRestartCommand:
         loop, bus = _make_loop()
         msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/restart")
 
+        async def _fast_sleep(_delay: float) -> None:
+            return None
+
+        scheduled: list[asyncio.Task] = []
+
+        def _capture_task(coro):
+            task = asyncio.create_task(coro)
+            scheduled.append(task)
+            return task
+
+        fake_asyncio = SimpleNamespace(
+            sleep=_fast_sleep,
+            create_task=_capture_task,
+        )
+
         with patch.object(loop, "_dispatch", new_callable=AsyncMock) as mock_dispatch, \
+             patch("nanobot.command.builtin.asyncio", new=fake_asyncio), \
              patch("nanobot.command.builtin.os.execv"):
             await bus.publish_inbound(msg)
 
             loop._running = True
             run_task = asyncio.create_task(loop.run())
-            await asyncio.sleep(0.1)
+            out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
             loop._running = False
             run_task.cancel()
             try:
@@ -106,8 +113,9 @@ class TestRestartCommand:
                 pass
 
             mock_dispatch.assert_not_called()
-            out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
             assert "Restarting" in out.content
+            assert scheduled
+            await scheduled[0]
 
     @pytest.mark.asyncio
     async def test_status_intercepted_in_run_loop(self):
@@ -120,7 +128,7 @@ class TestRestartCommand:
 
             loop._running = True
             run_task = asyncio.create_task(loop.run())
-            await asyncio.sleep(0.1)
+            out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
             loop._running = False
             run_task.cancel()
             try:
@@ -129,7 +137,6 @@ class TestRestartCommand:
                 pass
 
             mock_dispatch.assert_not_called()
-            out = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
             assert "nanobot" in out.content.lower() or "Model" in out.content
 
     @pytest.mark.asyncio
@@ -138,7 +145,7 @@ class TestRestartCommand:
         loop, _bus = _make_loop()
 
         run_task = asyncio.create_task(loop.run())
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0)
         run_task.cancel()
 
         with pytest.raises(asyncio.CancelledError):
@@ -207,8 +214,16 @@ class TestRestartCommand:
         assert "Tasks: 3 active" in response.content
 
     @pytest.mark.asyncio
-    async def test_run_agent_loop_resets_usage_when_provider_omits_it(self):
+    async def test_run_agent_loop_estimates_usage_when_provider_omits_it(self, monkeypatch):
         loop, _bus = _make_loop()
+        monkeypatch.setattr(
+            "nanobot.agent.runner.estimate_prompt_tokens_chain",
+            lambda *_args, **_kwargs: (123, "test"),
+        )
+        monkeypatch.setattr(
+            "nanobot.agent.runner.estimate_message_tokens",
+            lambda _message: 7,
+        )
         loop.provider.chat_with_retry = AsyncMock(side_effect=[
             LLMResponse(content="first", usage={"prompt_tokens": 9, "completion_tokens": 4}),
             LLMResponse(content="second", usage={}),
@@ -219,8 +234,9 @@ class TestRestartCommand:
         assert loop._last_usage["completion_tokens"] == 4
 
         await loop._run_agent_loop([])
-        assert loop._last_usage["prompt_tokens"] == 0
-        assert loop._last_usage["completion_tokens"] == 0
+        assert loop._last_usage["prompt_tokens"] == 123
+        assert loop._last_usage["completion_tokens"] == 7
+        assert loop._last_usage["estimated_tokens"] == 130
 
     @pytest.mark.asyncio
     async def test_status_falls_back_to_last_usage_when_context_estimate_missing(self):
@@ -242,6 +258,93 @@ class TestRestartCommand:
         assert "Tokens: 1200 in / 34 out" in response.content
         assert "Context: 1k/65k (1% of input budget)" in response.content
         assert "Tasks: 0 active" in response.content
+
+    @pytest.mark.asyncio
+    async def test_history_shows_recent_messages(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "tool", "content": "tool result"},  # should be filtered out
+            {"role": "user", "content": "How are you?"},
+            {"role": "assistant", "content": "I am doing well."},
+        ]
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "👤 You: Hello" in response.content
+        assert "🤖 Bot: Hi there!" in response.content
+        assert "tool result" not in response.content  # tool messages filtered
+        assert response.metadata == {"render_as": "text"}
+
+    @pytest.mark.asyncio
+    async def test_history_respects_count_argument(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = [
+            {"role": "user", "content": f"message {i}"} for i in range(20)
+        ]
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history 3")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Last 3 message(s)" in response.content
+        assert "message 19" in response.content  # most recent
+        assert "message 0" not in response.content  # too old
+
+    @pytest.mark.asyncio
+    async def test_history_clamps_count_and_extracts_text_blocks(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "visible text"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+                ],
+            },
+            *({"role": "assistant", "content": f"reply {i}"} for i in range(60)),
+        ]
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history 999")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "Last 50 message(s)" in response.content
+        assert "visible text" not in response.content
+        assert "reply 59" in response.content
+        assert "reply 9" not in response.content
+
+    @pytest.mark.asyncio
+    async def test_history_invalid_count_returns_usage(self):
+        loop, _bus = _make_loop()
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history nope")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert response.content.startswith("Usage: /history [count]")
+
+    @pytest.mark.asyncio
+    async def test_history_empty_session(self):
+        loop, _bus = _make_loop()
+        session = MagicMock()
+        session.get_history.return_value = []
+        loop.sessions.get_or_create.return_value = session
+
+        msg = InboundMessage(channel="telegram", sender_id="u1", chat_id="c1", content="/history")
+        response = await loop._process_message(msg)
+
+        assert response is not None
+        assert "No conversation history yet." in response.content
 
     @pytest.mark.asyncio
     async def test_process_direct_preserves_render_metadata(self):

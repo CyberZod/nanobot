@@ -12,9 +12,11 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.channels.manager import ChannelManager
-from nanobot.config.schema import ChannelsConfig
+from nanobot.config.loader import save_config
+from nanobot.config.schema import ChannelsConfig, Config
+from nanobot.providers.transcription import GroqTranscriptionProvider as _GroqProvider
+from nanobot.providers.transcription import OpenAITranscriptionProvider as _OpenAIProvider
 from nanobot.utils.restart import RestartNotice
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,6 +92,13 @@ def test_channels_config_builtin_fields_removed():
     assert not hasattr(cfg, "telegram")
     assert cfg.send_progress is True
     assert cfg.send_tool_hints is False
+    assert cfg.extract_document_text is True
+
+
+def test_channels_config_extract_document_text_accepts_camel_alias():
+    cfg = ChannelsConfig.model_validate({"extractDocumentText": False})
+
+    assert cfg.extract_document_text is False
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +117,23 @@ def test_discover_plugins_loads_entry_points():
 
     assert "line" in result
     assert result["line"] is _FakePlugin
+
+
+def test_discover_plugins_skips_names_outside_enabled_set():
+    from nanobot.channels.registry import discover_plugins
+
+    loaded: list[str] = []
+
+    def _load_disabled():
+        loaded.append("disabled")
+        return _FakePlugin
+
+    ep = SimpleNamespace(name="disabled", load=_load_disabled)
+    with patch(_EP_TARGET, return_value=[ep]):
+        result = discover_plugins({"enabled"})
+
+    assert result == {}
+    assert loaded == []
 
 
 def test_discover_plugins_handles_load_error():
@@ -151,6 +177,25 @@ def test_discover_all_includes_external_plugin():
     assert result["line"] is _FakePlugin
 
 
+def test_discover_enabled_imports_only_enabled_builtins():
+    from nanobot.channels.registry import discover_enabled
+
+    loaded: list[str] = []
+
+    def _load_channel(name: str):
+        loaded.append(name)
+        return _FakePlugin
+
+    with (
+        patch("nanobot.channels.registry.load_channel_class", side_effect=_load_channel),
+        patch(_EP_TARGET, return_value=[]),
+    ):
+        result = discover_enabled({"enabled"}, _names=["enabled", "disabled"])
+
+    assert result == {"enabled": _FakePlugin}
+    assert loaded == ["enabled"]
+
+
 def test_discover_all_builtin_shadows_plugin():
     from nanobot.channels.registry import discover_all
 
@@ -179,7 +224,7 @@ async def test_manager_loads_plugin_from_dict_config():
     )
 
     with patch(
-        "nanobot.channels.registry.discover_all",
+        "nanobot.channels.registry.discover_enabled",
         return_value={"fakeplugin": _FakePlugin},
     ):
         mgr = ChannelManager.__new__(ChannelManager)
@@ -194,98 +239,103 @@ async def test_manager_loads_plugin_from_dict_config():
 
 
 @pytest.mark.asyncio
-async def test_manager_propagates_groq_transcription_api_base_to_channels():
-    from nanobot.channels.manager import ChannelManager
-
-    fake_config = SimpleNamespace(
-        channels=ChannelsConfig.model_validate({
-            "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
-        }),
-        transcription_provider="groq",
-        providers=SimpleNamespace(
-            groq=SimpleNamespace(api_key="groq-key", api_base="http://proxy.local/v1/audio/transcriptions"),
-            openai=SimpleNamespace(api_key="openai-key", api_base="https://api.openai.com/v1/audio/transcriptions"),
-        ),
-    )
-
-    with patch(
-        "nanobot.channels.registry.discover_all",
-        return_value={"fakeplugin": _FakePlugin},
-    ):
-        mgr = ChannelManager.__new__(ChannelManager)
-        mgr.config = fake_config
-        mgr.bus = MessageBus()
-        mgr.channels = {}
-        mgr._dispatch_task = None
-        mgr._init_channels()
-
-    channel = mgr.channels["fakeplugin"]
-    assert channel.transcription_provider == "groq"
-    assert channel.transcription_api_key == "groq-key"
-    assert channel.transcription_api_base == "http://proxy.local/v1/audio/transcriptions"
-
-
-@pytest.mark.asyncio
-async def test_manager_propagates_openai_transcription_api_base_to_channels():
-    from nanobot.channels.manager import ChannelManager
-
-    fake_config = SimpleNamespace(
-        channels=ChannelsConfig.model_validate({
-            "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
-            "transcriptionProvider": "openai",
-        }),
-        providers=SimpleNamespace(
-            openai=SimpleNamespace(
-                api_key="openai-key",
-                api_base="http://proxy.local/v1/audio/transcriptions",
-            ),
-            groq=SimpleNamespace(api_key="groq-key", api_base=""),
-        ),
-    )
-
-    with patch(
-        "nanobot.channels.registry.discover_all",
-        return_value={"fakeplugin": _FakePlugin},
-    ):
-        mgr = ChannelManager.__new__(ChannelManager)
-        mgr.config = fake_config
-        mgr.bus = MessageBus()
-        mgr.channels = {}
-        mgr._dispatch_task = None
-        mgr._init_channels()
-
-    channel = mgr.channels["fakeplugin"]
-    assert channel.transcription_provider == "openai"
-    assert channel.transcription_api_key == "openai-key"
-    assert channel.transcription_api_base == "http://proxy.local/v1/audio/transcriptions"
-
-
-@pytest.mark.asyncio
-async def test_base_channel_passes_api_base_to_openai_transcription_provider():
-    """BaseChannel.transcribe_audio must forward transcription_api_base to OpenAI."""
+async def test_base_channel_reads_current_transcription_config_each_call(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """BaseChannel.transcribe_audio resolves config at call time, not manager init time."""
     from nanobot.providers import transcription as transcription_mod
 
-    channel = _FakePlugin({"enabled": True, "allowFrom": ["*"]}, MessageBus())
-    channel.transcription_provider = "openai"
-    channel.transcription_api_key = "k"
-    channel.transcription_api_base = "http://override/v1/audio/transcriptions"
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.transcription.provider = "openai"
+    config.transcription.model = "whisper-custom"
+    config.transcription.language = "en"
+    config.providers.openai.api_key = "openai-key"
+    config.providers.openai.api_base = "http://openai.local/v1/audio/transcriptions"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
 
-    captured: dict[str, object] = {}
+    channel = _FakePlugin({"enabled": True, "allowFrom": ["*"]}, MessageBus())
+
+    calls: list[dict[str, object]] = []
 
     class _StubOpenAI:
-        def __init__(self, api_key=None, api_base=None):
-            captured["api_key"] = api_key
-            captured["api_base"] = api_base
+        def __init__(self, api_key=None, api_base=None, language=None, model=None):
+            calls.append({
+                "provider": "openai",
+                "api_key": api_key,
+                "api_base": api_base,
+                "language": language,
+                "model": model,
+            })
 
         async def transcribe(self, file_path):
-            return "ok"
+            return "openai-ok"
 
-    with patch.object(transcription_mod, "OpenAITranscriptionProvider", _StubOpenAI):
-        result = await channel.transcribe_audio("/tmp/does-not-matter.wav")
+    class _StubGroq:
+        def __init__(self, api_key=None, api_base=None, language=None, model=None):
+            calls.append({
+                "provider": "groq",
+                "api_key": api_key,
+                "api_base": api_base,
+                "language": language,
+                "model": model,
+            })
 
-    assert result == "ok"
-    assert captured["api_key"] == "k"
-    assert captured["api_base"] == "http://override/v1/audio/transcriptions"
+        async def transcribe(self, file_path):
+            return "groq-ok"
+
+    with (
+        patch.object(transcription_mod, "OpenAITranscriptionProvider", _StubOpenAI),
+        patch.object(transcription_mod, "GroqTranscriptionProvider", _StubGroq),
+    ):
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "openai-ok"
+
+        config.transcription.provider = "groq"
+        config.transcription.model = "whisper-large-v3-turbo"
+        config.transcription.language = "ko"
+        config.providers.groq.api_key = "groq-key"
+        config.providers.groq.api_base = "http://groq.local/v1/audio/transcriptions"
+        save_config(config, config_path)
+
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == "groq-ok"
+
+    assert calls == [
+        {
+            "provider": "openai",
+            "api_key": "openai-key",
+            "api_base": "http://openai.local/v1/audio/transcriptions",
+            "language": "en",
+            "model": "whisper-custom",
+        },
+        {
+            "provider": "groq",
+            "api_key": "groq-key",
+            "api_base": "http://groq.local/v1/audio/transcriptions",
+            "language": "ko",
+            "model": "whisper-large-v3-turbo",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_base_channel_respects_disabled_transcription_config(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    config_path = tmp_path / "config.json"
+    config = Config()
+    config.transcription.enabled = False
+    config.providers.groq.api_key = "groq-key"
+    save_config(config, config_path)
+    monkeypatch.setattr("nanobot.config.loader._current_config_path", config_path)
+
+    channel = _FakePlugin({"enabled": True, "allowFrom": ["*"]}, MessageBus())
+
+    with patch("nanobot.providers.transcription.GroqTranscriptionProvider") as provider:
+        assert await channel.transcribe_audio("/tmp/does-not-matter.wav") == ""
+    provider.assert_not_called()
 
 
 def test_openai_transcription_provider_honors_api_base_argument():
@@ -300,10 +350,82 @@ def test_openai_transcription_provider_honors_api_base_argument():
     assert custom.api_url == "http://override/v1/audio/transcriptions"
 
 
+# ---------------------------------------------------------------------------
+# Transcription provider HTTP tests
+# ---------------------------------------------------------------------------
+
+
+class _StubResponse:
+    status_code = 200
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {"text": "hello"}
+
+
+def _stub_async_client(captured: dict[str, object]):
+    """Return an httpx.AsyncClient stub that records POST calls into *captured*."""
+    class _AsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, headers=None, files=None, timeout=None):
+            captured["files"] = files
+            return _StubResponse()
+
+    return _AsyncClient()
+
+
+@pytest.mark.parametrize(
+    "provider_cls,language",
+    [(_GroqProvider, "ko"), (_OpenAIProvider, "en")],
+    ids=["groq", "openai"],
+)
+@pytest.mark.asyncio
+async def test_transcription_provider_includes_language(tmp_path, provider_cls, language):
+    """Provider must include the 'language' field in multipart body when set."""
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    with patch("nanobot.providers.transcription.httpx.AsyncClient", return_value=_stub_async_client(captured)):
+        provider = provider_cls(api_key="k", language=language)
+        result = await provider.transcribe(audio)
+
+    assert result == "hello"
+    assert captured["files"]["language"] == (None, language)
+
+
+@pytest.mark.parametrize(
+    "provider_cls",
+    [_GroqProvider, _OpenAIProvider],
+    ids=["groq", "openai"],
+)
+@pytest.mark.asyncio
+async def test_transcription_provider_omits_language_when_none(tmp_path, provider_cls):
+    """When language is not set, the 'language' key must be absent from the multipart body."""
+    audio = tmp_path / "sample.wav"
+    audio.write_bytes(b"audio")
+    captured: dict[str, object] = {}
+
+    with patch("nanobot.providers.transcription.httpx.AsyncClient", return_value=_stub_async_client(captured)):
+        provider = provider_cls(api_key="k")
+        result = await provider.transcribe(audio)
+
+    assert result == "hello"
+    assert "language" not in captured["files"]
+
+
 def test_channels_login_uses_discovered_plugin_class(monkeypatch):
+    from typer.testing import CliRunner
+
     from nanobot.cli.commands import app
     from nanobot.config.schema import Config
-    from typer.testing import CliRunner
 
     runner = CliRunner()
     seen: dict[str, object] = {}
@@ -329,9 +451,10 @@ def test_channels_login_uses_discovered_plugin_class(monkeypatch):
 
 
 def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
     from nanobot.cli.commands import app
     from nanobot.config.schema import Config
-    from typer.testing import CliRunner
 
     runner = CliRunner()
     seen: dict[str, object] = {}
@@ -358,9 +481,10 @@ def test_channels_login_sets_custom_config_path(monkeypatch, tmp_path):
 
 
 def test_channels_status_sets_custom_config_path(monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+
     from nanobot.cli.commands import app
     from nanobot.config.schema import Config
-    from typer.testing import CliRunner
 
     runner = CliRunner()
     seen: dict[str, object] = {}
@@ -388,10 +512,8 @@ async def test_manager_skips_disabled_plugin():
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
     )
 
-    with patch(
-        "nanobot.channels.registry.discover_all",
-        return_value={"fakeplugin": _FakePlugin},
-    ):
+    ep = _make_entry_point("fakeplugin", _FakePlugin)
+    with patch(_EP_TARGET, return_value=[ep]):
         mgr = ChannelManager.__new__(ChannelManager)
         mgr.config = fake_config
         mgr.bus = MessageBus()
@@ -453,6 +575,24 @@ def test_channels_config_send_max_retries_upper_bound():
     # Value above upper bound should be rejected
     with pytest.raises(ValidationError):
         ChannelsConfig(send_max_retries=11)
+
+
+def test_channels_config_transcription_language_pattern():
+    """transcription_language must match ISO-639 format (2-3 lowercase letters) or be None."""
+    from pydantic import ValidationError
+
+    # Valid values
+    assert ChannelsConfig(transcription_language="en").transcription_language == "en"
+    assert ChannelsConfig(transcription_language="kor").transcription_language == "kor"
+    assert ChannelsConfig(transcription_language=None).transcription_language is None
+
+    # Invalid values
+    with pytest.raises(ValidationError):
+        ChannelsConfig(transcription_language="EN")       # uppercase
+    with pytest.raises(ValidationError):
+        ChannelsConfig(transcription_language="english")   # full word
+    with pytest.raises(ValidationError):
+        ChannelsConfig(transcription_language="en-US")     # BCP 47 tag
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +804,50 @@ async def test_send_with_retry_skips_send_when_streamed():
     assert send_delta_called is False
 
 
+def test_outbound_duplicate_suppression_is_scoped_to_origin_message() -> None:
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(send_max_retries=3),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.bus = MessageBus()
+    mgr.channels = {}
+    mgr._dispatch_task = None
+    mgr._origin_reply_fingerprints = {}
+
+    first = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": "msg-1"},
+    )
+    duplicate = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="  Done  ",
+        metadata={"origin_message_id": "msg-1"},
+    )
+    separate_turn = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done",
+        metadata={"message_id": "msg-2"},
+    )
+    new_origin_content = OutboundMessage(
+        channel="feishu",
+        chat_id="chat123",
+        content="Done with extra details",
+        metadata={"origin_message_id": "msg-1"},
+    )
+
+    assert mgr._should_suppress_outbound(first) is False
+    assert mgr._should_suppress_outbound(duplicate) is True
+    assert mgr._should_suppress_outbound(separate_turn) is False
+    assert mgr._should_suppress_outbound(new_origin_content) is False
+
+
 @pytest.mark.asyncio
 async def test_send_with_retry_propagates_cancelled_error():
     """_send_with_retry should re-raise CancelledError for graceful shutdown."""
@@ -789,8 +973,8 @@ class _StartableChannel(BaseChannel):
 
 
 @pytest.mark.asyncio
-async def test_validate_allow_from_raises_on_empty_list():
-    """_validate_allow_from should raise SystemExit when allow_from is empty list."""
+async def test_validate_allow_from_allows_empty_list():
+    """Empty allow_from is valid now — pairing store handles unapproved senders."""
     fake_config = SimpleNamespace(
         channels=ChannelsConfig(),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
@@ -801,10 +985,10 @@ async def test_validate_allow_from_raises_on_empty_list():
     mgr.channels = {"test": _ChannelWithAllowFrom(fake_config, None, [])}
     mgr._dispatch_task = None
 
-    with pytest.raises(SystemExit) as exc_info:
-        mgr._validate_allow_from()
-
-    assert "empty allowFrom" in str(exc_info.value)
+    # Should not raise — empty list defers to pairing store
+    mgr._validate_allow_from()
+    assert list(mgr.channels) == ["test"]
+    assert mgr.channels["test"].config.allow_from == []
 
 
 @pytest.mark.asyncio
@@ -822,11 +1006,13 @@ async def test_validate_allow_from_passes_with_asterisk():
 
     # Should not raise
     mgr._validate_allow_from()
+    assert list(mgr.channels) == ["test"]
+    assert mgr.channels["test"].config.allow_from == ["*"]
 
 
 @pytest.mark.asyncio
-async def test_validate_allow_from_raises_on_empty_dict_allow_from():
-    """_validate_allow_from should reject empty dict-backed allow_from lists."""
+async def test_validate_allow_from_allows_empty_dict_allow_from():
+    """Empty dict-backed allow_from is valid — pairing store handles approval."""
     fake_config = SimpleNamespace(
         channels=ChannelsConfig(),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
@@ -837,10 +1023,41 @@ async def test_validate_allow_from_raises_on_empty_dict_allow_from():
     mgr.channels = {"test": _ChannelWithAllowFrom({"enabled": True}, None, [])}
     mgr._dispatch_task = None
 
-    with pytest.raises(SystemExit) as exc_info:
-        mgr._validate_allow_from()
+    mgr._validate_allow_from()
+    assert list(mgr.channels) == ["test"]
+    assert mgr.channels["test"].config["allow_from"] == []
 
-    assert "empty allowFrom" in str(exc_info.value)
+
+@pytest.mark.asyncio
+async def test_validate_allow_from_allows_missing_allow_from():
+    """Omitted allowFrom is valid — channel operates in pairing-only mode."""
+    fake_config = SimpleNamespace(
+        channels=ChannelsConfig(),
+        providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+    )
+
+    class _NoAllowFromChannel(BaseChannel):
+        name = "noallow"
+        display_name = "No Allow"
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+        async def send(self, msg: OutboundMessage) -> None:
+            pass
+
+    mgr = ChannelManager.__new__(ChannelManager)
+    mgr.config = fake_config
+    mgr.channels = {"test": _NoAllowFromChannel({"enabled": True}, None)}
+    mgr._dispatch_task = None
+
+    # Should not raise — pairing-only mode
+    mgr._validate_allow_from()
+    assert list(mgr.channels) == ["test"]
+    assert "allow_from" not in mgr.channels["test"].config
 
 
 @pytest.mark.asyncio
@@ -968,6 +1185,8 @@ async def test_start_channel_logs_error_on_failure():
 
     # Should not raise, just log error
     await mgr._start_channel("failing", ch)
+    assert mgr.channels == {}
+    assert mgr._dispatch_task is None
 
 
 @pytest.mark.asyncio
@@ -999,6 +1218,8 @@ async def test_stop_all_handles_channel_exception():
 
     # Should not raise even if channel.stop() raises
     await mgr.stop_all()
+    assert list(mgr.channels) == ["stopfailing"]
+    assert mgr._dispatch_task is None
 
 
 @pytest.mark.asyncio

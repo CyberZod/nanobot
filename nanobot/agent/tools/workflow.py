@@ -78,6 +78,11 @@ class _SessionMeta:
 class WorkflowTool(Tool):
     """Send messages to the Maroc workflow agency to execute workflows."""
 
+    # Registered manually in AgentLoop (needs the tool registry to look up
+    # `message`), so opt out of ToolLoader auto-discovery to avoid a double
+    # registration / construction with tools=None.
+    _plugin_discoverable: bool = False
+
     def __init__(self, tools: Any = None) -> None:
         # Per-session metadata: workflow name + inputs from the originating
         # execute call, whether preview has been shown (gates finalize), the

@@ -1,4 +1,37 @@
+# Project-specific
+.worktrees/
+.worktree/
+.assets
+.docs
+.env
+.web
+.orion
+
+# Desktop app generated artifacts
+desktop/build/
+desktop/dist/
+desktop/node_modules/
+desktop/package-lock.json
+desktop/resources/nanobot-engine/
+
+# Claude / AI assistant artifacts
+docs/superpowers/
+docs/plans/
+
+# webui (monorepo frontend)
+webui/node_modules/
+webui/dist/
+webui/coverage/
+webui/.vite/
+*.tsbuildinfo
+
 # Byte-compiled / optimized / DLL files
+# Python bytecode & caches
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
 __pycache__/
 *.py[cod]
 *$py.class
@@ -59,3 +92,16 @@ venv.bak/
 # OS
 .DS_Store
 Thumbs.db
+
+# Environment & secrets (keep examples tracked if needed)
+.env.*
+!.env.example
+
+# Logs & temp
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+exp/
+.playwright-mcp/

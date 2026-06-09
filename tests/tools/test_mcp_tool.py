@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack, asynccontextmanager
 import sys
+from contextlib import asynccontextmanager
 from types import ModuleType, SimpleNamespace
 
+import httpx
 import pytest
 
+import nanobot.agent.tools.mcp as mcp_mod
 from nanobot.agent.tools.mcp import (
-    MCPResourceWrapper,
     MCPPromptWrapper,
+    MCPResourceWrapper,
     MCPToolWrapper,
+    _normalize_windows_stdio_command,
+    _sanitize_name,
     connect_mcp_servers,
 )
 from nanobot.agent.tools.registry import ToolRegistry
@@ -49,10 +53,17 @@ def _fake_mcp_module(
     )
 
     class _FakeStdioServerParameters:
-        def __init__(self, command: str, args: list[str], env: dict | None = None) -> None:
+        def __init__(
+            self,
+            command: str,
+            args: list[str],
+            env: dict | None = None,
+            cwd: str | None = None,
+        ) -> None:
             self.command = command
             self.args = args
             self.env = env
+            self.cwd = cwd
 
     class _FakeClientSession:
         def __init__(self, _read: object, _write: object) -> None:
@@ -176,6 +187,99 @@ def test_wrapper_normalizes_nullable_property_anyof() -> None:
         "description": "optional name",
         "nullable": True,
     }
+
+
+def test_normalize_windows_stdio_command_is_noop_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "posix", raising=False)
+
+    command, args, env = _normalize_windows_stdio_command(
+        "npx",
+        ["-y", "chrome-devtools-mcp@latest"],
+        {"FOO": "bar"},
+    )
+
+    assert command == "npx"
+    assert args == ["-y", "chrome-devtools-mcp@latest"]
+    assert env == {"FOO": "bar"}
+
+
+def test_normalize_windows_stdio_command_wraps_npx_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        mcp_mod.shutil,
+        "which",
+        lambda command, path=None: r"C:\Program Files\nodejs\npx.cmd",
+    )
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+
+    command, args, env = _normalize_windows_stdio_command(
+        "npx",
+        ["-y", "chrome-devtools-mcp@latest"],
+        None,
+    )
+
+    assert command == r"C:\Windows\System32\cmd.exe"
+    assert args == ["/d", "/c", "npx", "-y", "chrome-devtools-mcp@latest"]
+    assert env is None
+
+
+def test_normalize_windows_stdio_command_wraps_resolved_cmd_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+
+    def _fake_which(command: str, path: str | None = None) -> str:
+        assert command == "custom-launcher"
+        assert path == r"C:\Tools"
+        return r"C:\Tools\custom-launcher.cmd"
+
+    monkeypatch.setattr(mcp_mod.shutil, "which", _fake_which)
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+
+    command, args, _env = _normalize_windows_stdio_command(
+        "custom-launcher",
+        ["serve"],
+        {"PATH": r"C:\Tools"},
+    )
+
+    assert command == r"C:\Windows\System32\cmd.exe"
+    assert args == ["/d", "/c", "custom-launcher", "serve"]
+
+
+def test_normalize_windows_stdio_command_keeps_real_executables_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+
+    command, args, env = _normalize_windows_stdio_command(
+        "python.exe",
+        ["-m", "http.server"],
+        {"FOO": "bar"},
+    )
+
+    assert command == "python.exe"
+    assert args == ["-m", "http.server"]
+    assert env == {"FOO": "bar"}
+
+
+def test_normalize_windows_stdio_command_skips_existing_shells(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+
+    command, args, env = _normalize_windows_stdio_command(
+        "cmd.exe",
+        ["/c", "echo", "hello"],
+        None,
+    )
+
+    assert command == "cmd.exe"
+    assert args == ["/c", "echo", "hello"]
+    assert env is None
 
 
 @pytest.mark.asyncio
@@ -371,7 +475,7 @@ async def test_connect_mcp_servers_logs_stdio_pollution_hint(
         yield  # pragma: no cover
 
     monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _broken_stdio_client)
-    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.error", _error)
+    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.exception", _error)
 
     registry = ToolRegistry()
     stacks = await connect_mcp_servers({"gh": MCPServerConfig(command="github-mcp")}, registry)
@@ -381,6 +485,124 @@ async def test_connect_mcp_servers_logs_stdio_pollution_hint(
     assert "stdio protocol pollution" in messages[-1]
     assert "stdout" in messages[-1]
     assert "stderr" in messages[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "config",
+    [
+        MCPServerConfig(url="http://127.0.0.1:9/sse"),
+        MCPServerConfig(type="streamableHttp", url="http://127.0.0.1:9/mcp"),
+    ],
+)
+async def test_connect_mcp_servers_rejects_unsafe_http_urls_before_probe(
+    config: MCPServerConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempted_connections: list[tuple[object, ...]] = []
+    warnings: list[str] = []
+
+    async def _open_connection(*args: object, **_kwargs: object):
+        attempted_connections.append(args)
+        raise AssertionError("unsafe MCP URL should be rejected before TCP probe")
+
+    def _warning(message: str, *args: object) -> None:
+        warnings.append(message.format(*args))
+
+    monkeypatch.setattr(mcp_mod.asyncio, "open_connection", _open_connection)
+    monkeypatch.setattr("nanobot.agent.tools.mcp.logger.warning", _warning)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers({"local": config}, registry)
+
+    assert stacks == {}
+    assert registry.tool_names == []
+    assert attempted_connections == []
+    assert any("blocked unsafe URL" in warning for warning in warnings)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_transport"),
+    [
+        (MCPServerConfig(type="sse", url="https://mcp.example.com/sse"), "sse"),
+        (
+            MCPServerConfig(type="streamableHttp", url="https://mcp.example.com/mcp"),
+            "streamableHttp",
+        ),
+    ],
+)
+async def test_connect_mcp_servers_http_clients_reject_unsafe_redirect_targets(
+    config: MCPServerConfig,
+    expected_transport: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checked_urls: list[str] = []
+    sent_urls: list[str] = []
+    used_transports: list[str] = []
+
+    def _validate(url: str) -> tuple[bool, str]:
+        checked_urls.append(url)
+        if url == "http://127.0.0.1/private":
+            return False, "loopback blocked"
+        return True, ""
+
+    async def _reachable(_url: str) -> bool:
+        return True
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        sent_urls.append(str(request.url))
+        if str(request.url) == "https://example.com/start":
+            return httpx.Response(
+                302,
+                headers={"Location": "http://127.0.0.1/private"},
+                request=request,
+            )
+        raise AssertionError("unsafe redirect target should be blocked before transport")
+
+    original_async_client = httpx.AsyncClient
+
+    def _async_client_with_mock_transport(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        kwargs.setdefault("transport", httpx.MockTransport(_handler))
+        return original_async_client(*args, **kwargs)
+
+    @asynccontextmanager
+    async def _fake_sse_client(_url: str, httpx_client_factory=None):
+        assert httpx_client_factory is not None
+        used_transports.append("sse")
+        async with httpx_client_factory() as client:
+            await client.get("https://example.com/start")
+        yield object(), object()
+
+    @asynccontextmanager
+    async def _fake_streamable_http_client(_url: str, http_client=None):
+        assert http_client is not None
+        used_transports.append("streamableHttp")
+        await http_client.get("https://example.com/start")
+        yield object(), object(), object()
+
+    monkeypatch.setattr(mcp_mod, "validate_url_target", _validate)
+    monkeypatch.setattr(mcp_mod, "_probe_http_url", _reachable)
+    monkeypatch.setattr(mcp_mod.httpx, "AsyncClient", _async_client_with_mock_transport)
+    monkeypatch.setattr(sys.modules["mcp.client.sse"], "sse_client", _fake_sse_client)
+    monkeypatch.setattr(
+        sys.modules["mcp.client.streamable_http"],
+        "streamable_http_client",
+        _fake_streamable_http_client,
+    )
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers({"remote": config}, registry)
+
+    assert stacks == {}
+    assert registry.tool_names == []
+    assert used_transports == [expected_transport]
+    assert checked_urls == [
+        config.url,
+        "https://example.com/start",
+        "http://127.0.0.1/private",
+    ]
+    assert sent_urls == ["https://example.com/start"]
 
 
 @pytest.mark.asyncio
@@ -421,6 +643,74 @@ async def test_connect_mcp_servers_one_failure_does_not_block_others(
 
     assert registry.tool_names == ["mcp_good_demo"]
     assert set(stacks) == {"good"}
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_wraps_windows_stdio_launchers(
+    fake_mcp_runtime: dict[str, object | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    captured: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def _capturing_stdio_client(params: object):
+        captured["command"] = params.command
+        captured["args"] = params.args
+        captured["env"] = params.env
+        yield object(), object()
+
+    monkeypatch.setattr(mcp_mod.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        mcp_mod.shutil,
+        "which",
+        lambda command, path=None: r"C:\Program Files\nodejs\npx.cmd",
+    )
+    monkeypatch.setenv("COMSPEC", r"C:\Windows\System32\cmd.exe")
+    monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _capturing_stdio_client)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {
+            "test": MCPServerConfig(
+                command="npx",
+                args=["-y", "chrome-devtools-mcp@latest"],
+            )
+        },
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert captured["command"] == r"C:\Windows\System32\cmd.exe"
+    assert captured["args"] == ["/d", "/c", "npx", "-y", "chrome-devtools-mcp@latest"]
+    assert captured["env"] is None
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_passes_stdio_cwd(
+    fake_mcp_runtime: dict[str, object | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session(["demo"])
+    captured: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def _capturing_stdio_client(params: object):
+        captured["cwd"] = params.cwd
+        yield object(), object()
+
+    monkeypatch.setattr(sys.modules["mcp.client.stdio"], "stdio_client", _capturing_stdio_client)
+
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", cwd="/tmp/nanobot-mcp-test")},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert captured["cwd"] == "/tmp/nanobot-mcp-test"
 
 
 # ---------------------------------------------------------------------------
@@ -661,3 +951,114 @@ async def test_connect_registers_resources_and_prompts(
     assert "mcp_test_tool_a" in registry.tool_names
     assert "mcp_test_resource_res_b" in registry.tool_names
     assert "mcp_test_prompt_prompt_c" in registry.tool_names
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_name tests
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_name_replaces_spaces() -> None:
+    assert _sanitize_name("PostgreSQL System Information") == "PostgreSQL_System_Information"
+
+
+def test_sanitize_name_replaces_special_characters() -> None:
+    assert _sanitize_name("foo.bar@baz!") == "foo_bar_baz_"
+
+
+def test_sanitize_name_collapses_consecutive_underscores() -> None:
+    assert _sanitize_name("a   b") == "a_b"
+
+
+def test_sanitize_name_preserves_valid_characters() -> None:
+    assert _sanitize_name("my-tool_v2") == "my-tool_v2"
+
+
+def test_sanitize_name_noop_for_already_clean_names() -> None:
+    assert _sanitize_name("mcp_server_tool") == "mcp_server_tool"
+
+
+# ---------------------------------------------------------------------------
+# Wrapper sanitization tests
+# ---------------------------------------------------------------------------
+
+
+def test_tool_wrapper_sanitizes_name() -> None:
+    tool_def = SimpleNamespace(
+        name="My Tool",
+        description="tool with spaces",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "srv", tool_def)
+    assert wrapper.name == "mcp_srv_My_Tool"
+
+
+def test_resource_wrapper_sanitizes_name() -> None:
+    resource_def = SimpleNamespace(
+        name="PostgreSQL System Information",
+        uri="file:///pg/info",
+        description="PG info",
+    )
+    wrapper = MCPResourceWrapper(None, "srv", resource_def)
+    assert wrapper.name == "mcp_srv_resource_PostgreSQL_System_Information"
+
+
+def test_prompt_wrapper_sanitizes_name() -> None:
+    prompt_def = SimpleNamespace(
+        name="design-schema",
+        description="Design schema",
+        arguments=None,
+    )
+    # Hyphens are allowed, so this should pass through unchanged
+    wrapper = MCPPromptWrapper(None, "my server", prompt_def)
+    assert wrapper.name == "mcp_my_server_prompt_design-schema"
+
+
+def test_tool_wrapper_preserves_original_name_for_mcp_call() -> None:
+    tool_def = SimpleNamespace(
+        name="My Tool",
+        description="tool with spaces",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    wrapper = MCPToolWrapper(SimpleNamespace(call_tool=None), "srv", tool_def)
+    # The sanitized API-facing name differs from the original MCP name
+    assert wrapper.name == "mcp_srv_My_Tool"
+    assert wrapper._original_name == "My Tool"
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_sanitizes_resource_names(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session_with_capabilities(
+        tool_names=[],
+        resource_names=["PostgreSQL System Information"],
+        prompt_names=[],
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake")},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert "mcp_test_resource_PostgreSQL_System_Information" in registry.tool_names
+
+
+@pytest.mark.asyncio
+async def test_connect_mcp_servers_enabled_tools_matches_sanitized_name(
+    fake_mcp_runtime: dict[str, object | None],
+) -> None:
+    fake_mcp_runtime["session"] = _make_fake_session_with_capabilities(
+        tool_names=["My Tool", "other"],
+    )
+    registry = ToolRegistry()
+    stacks = await connect_mcp_servers(
+        {"test": MCPServerConfig(command="fake", enabled_tools=["mcp_test_My_Tool"])},
+        registry,
+    )
+    for stack in stacks.values():
+        await stack.aclose()
+
+    assert registry.tool_names == ["mcp_test_My_Tool"]
